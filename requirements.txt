@@ -1,0 +1,16 @@
+# Flask API server
+flask>=3.0.0
+flask-cors>=4.0.0
+
+# Already in enterprise-migration/requirements.txt — listed here for
+# completeness so the Flask venv is self-contained:
+google-api-python-client>=2.108.0
+google-auth>=2.25.2
+google-auth-oauthlib>=1.2.0
+google-auth-httplib2>=0.2.0
+google-cloud-storage>=2.12.0
+mysql-connector-python>=8.3.0
+requests>=2.31.0
+tqdm>=4.66.1
+tenacity>=8.2.3
+python-magic>=0.4.27

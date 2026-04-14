@@ -1,0 +1,12 @@
+# Uploaded credential files — NEVER commit these
+uploads/
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.env
+
+# Logs
+*.log
+reports/
