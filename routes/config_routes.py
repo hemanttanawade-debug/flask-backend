@@ -10,7 +10,7 @@ import sys
 import uuid
 from pathlib import Path
 from flask import Blueprint, request, jsonify, current_app
-
+from routes.auth_routes import require_auth
 import session_state as state
 
 config_bp  = Blueprint("config", __name__)
@@ -22,6 +22,7 @@ BACKEND_DIR = Path(__file__).parent.parent.parent / "enterprise-migration"
 # ─────────────────────────────────────────────────────────────────────────────
 
 @config_bp.route("/config/new", methods=["POST"])
+@require_auth  
 def new_session():
     """
     Call when user clicks 'Start New Migration'.
@@ -43,6 +44,7 @@ def new_session():
 # ─────────────────────────────────────────────────────────────────────────────
 
 @config_bp.route("/config", methods=["POST"])
+@require_auth 
 def save_config():
     """
     Accepts multipart/form-data:
@@ -115,6 +117,7 @@ def save_config():
 # ─────────────────────────────────────────────────────────────────────────────
 
 @config_bp.route("/validate", methods=["POST"])
+@require_auth
 def validate_connection():
     """
     Builds DomainAuthManager exactly as main.py does and pings both domains.

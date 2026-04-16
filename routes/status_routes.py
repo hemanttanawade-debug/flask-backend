@@ -9,7 +9,7 @@ Handles:
 
 from pathlib import Path
 from flask import Blueprint, jsonify, send_from_directory, abort
-
+from routes.auth_routes import require_auth
 import session_state as state
 
 status_bp = Blueprint("status", __name__)
@@ -23,6 +23,7 @@ BACKEND_REPORT_DIR = Path(__file__).parent.parent.parent / "enterprise-migration
 # ─────────────────────────────────────────────────────────────────────────────
 
 @status_bp.route("/migration/<migration_id>/status", methods=["GET"])
+@require_auth
 def get_status(migration_id: str):
     """
     Returns current migration progress.
@@ -55,6 +56,7 @@ def get_status(migration_id: str):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @status_bp.route("/migration/<migration_id>/logs", methods=["GET"])
+@require_auth
 def get_logs(migration_id: str):
     """Returns the full log buffer for the current/last migration."""
     return jsonify({"logs": state.migration.get("logs", [])})
@@ -65,6 +67,7 @@ def get_logs(migration_id: str):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @status_bp.route("/migration/<migration_id>/report", methods=["GET"])
+@require_auth
 def download_report(migration_id: str):
     """
     Streams the latest report file to the browser as a download.
