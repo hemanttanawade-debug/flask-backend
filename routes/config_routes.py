@@ -14,7 +14,7 @@ from routes.auth_routes import require_auth
 import session_state as state
 
 config_bp  = Blueprint("config", __name__)
-BACKEND_DIR = Path(__file__).parent.parent.parent / "enterprise-migration"
+BACKEND_DIR = Path.home() / "amey"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

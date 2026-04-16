@@ -14,8 +14,9 @@ import session_state as state
 
 status_bp = Blueprint("status", __name__)
 
+BACKEND_DIR = Path.home() / "amey"
 REPORT_DIR = Path(__file__).parent.parent / "reports"
-BACKEND_REPORT_DIR = Path(__file__).parent.parent.parent / "enterprise-migration" / "reports"
+BACKEND_REPORT_DIR = BACKEND_DIR / "reports"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

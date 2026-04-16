@@ -2,6 +2,9 @@
 Flask Application Factory
 Enterprise Drive Migration - API Server
 """
+# app.py — correct order
+from dotenv import load_dotenv
+load_dotenv()  # ← MUST be before any blueprint import
 
 from flask import Flask
 from flask_cors import CORS
@@ -16,7 +19,8 @@ def create_app():
     app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB max upload
 
     # Allow requests from the React frontend (Vite dev server + production)
-    CORS(app, resources={r"/api/*": {"origins": ["http://localhost:5173", "http://localhost:3000", "https://migration.shivaami.in"]}})
+    CORS(app, resources={r"/api/*": {"origins": ["https://migration.shivaami.in"]}})
+
 
     # Register blueprints
     app.register_blueprint(auth_bp,      url_prefix="/api")
