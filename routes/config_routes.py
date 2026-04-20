@@ -2,11 +2,13 @@
 routes/config_routes.py
 
   POST /api/config/new        — start a new wizard session (resets in-memory state only)
-  POST /api/config            — save domain config + overwrite credential files in-place
+  POST /api/config            — save domain config + credential files (first time)
+  PUT  /api/config            — update domain config; credential files optional
   POST /api/validate          — test source/dest connectivity
   POST /api/migration-mode    — save chosen migration mode for this session
 """
 
+import os
 import sys
 import uuid
 from pathlib import Path
@@ -28,7 +30,7 @@ def new_session():
     """
     Resets in-memory wizard state and returns a fresh sessionId.
     Credential files on disk are NOT deleted — they will be overwritten
-    only when the user uploads new ones in Step 0.
+    only when the user explicitly uploads new ones in Step 0.
     """
     sid = str(uuid.uuid4())
     state.new_session(sid, auto_delete_previous=False)
@@ -39,10 +41,11 @@ def new_session():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# POST /api/config
+# POST /api/config  — first-time save (credential files required if not on disk)
+# PUT  /api/config  — update       (credential files optional; kept if not sent)
 # ─────────────────────────────────────────────────────────────────────────────
 
-@config_bp.route("/config", methods=["POST"])
+@config_bp.route("/config", methods=["POST", "PUT"])
 @require_auth
 def save_config():
     """
@@ -53,12 +56,23 @@ def save_config():
       - sourceCredentials          (.json) → overwrites uploads/credential/source_credentials.json
       - destinationCredentials     (.json) → overwrites uploads/credential/dest_credentials.json
 
+    POST  — credential files required if they don't already exist on disk.
+    PUT   — credential files are optional; existing files on disk are kept as-is
+            if no new file is uploaded (allows updating only domain/email fields).
+
+    KEY FIX — ERR_UPLOAD_FILE_CHANGED:
+      The browser throws this when it tries to re-read a file that changed on
+      disk after the user selected it. We fix this by calling file.read() to
+      pull ALL bytes into memory immediately, then writing from that buffer —
+      so Flask never touches the original file handle again.
+
     Files are ALWAYS saved to the same fixed paths — never in session subfolders.
     The user's original filename is ignored.
     File contents are never logged or returned.
     """
-    form  = request.form
-    files = request.files
+    is_update = request.method == "PUT"
+    form      = request.form
+    files     = request.files
 
     sid = form.get("sessionId") or state.session_id
     if not sid:
@@ -72,8 +86,10 @@ def save_config():
     ]
     missing = [f for f in required_fields if not form.get(f)]
     if missing:
-        return jsonify({"success": False,
-                        "message": f"Missing fields: {', '.join(missing)}"}), 400
+        return jsonify({
+            "success": False,
+            "message": f"Missing fields: {', '.join(missing)}",
+        }), 400
 
     # Persist domain / email fields in memory
     state.config["source_domain"]      = form["sourceDomain"]
@@ -81,43 +97,85 @@ def save_config():
     state.config["dest_domain"]        = form["destinationDomain"]
     state.config["dest_admin_email"]   = form["destinationAdminEmail"]
 
-    # Save credential files — always overwrite the fixed paths
+    # ── Handle credential files ───────────────────────────────────────────────
     for field, kind in [
         ("sourceCredentials",      "source"),
         ("destinationCredentials", "dest"),
     ]:
-        file = files.get(field)
+        file       = files.get(field)
+        fixed_path = (
+            state.SOURCE_CREDENTIALS_PATH if kind == "source"
+            else state.DEST_CREDENTIALS_PATH
+        )
+
         if file and file.filename:
-            # Overwrite uploads/credential/<kind>_credentials.json in-place
-            saved = state.save_credential_file(file, kind)
-            state.config[f"{kind}_credentials_file"] = saved
+            # ── Read ALL bytes into memory immediately ────────────────────────
+            # Fix for ERR_UPLOAD_FILE_CHANGED: once bytes are in a Python
+            # variable the browser file handle is no longer needed — we write
+            # from our own in-memory buffer, immune to on-disk changes.
+            try:
+                file_bytes = file.read()
+            except Exception as e:
+                return jsonify({
+                    "success": False,
+                    "message": (
+                        f"Could not read {field} — the file may have changed "
+                        f"after you selected it. Please re-select it and try "
+                        f"again. ({e})"
+                    ),
+                }), 400
+
+            if len(file_bytes) == 0:
+                return jsonify({
+                    "success": False,
+                    "message": f"{field}: uploaded file is empty.",
+                }), 400
+
+            # Write from in-memory buffer — immune to subsequent on-disk changes
+            try:
+                state.CREDENTIAL_DIR.mkdir(parents=True, exist_ok=True)
+                fixed_path.write_bytes(file_bytes)
+                os.chmod(str(fixed_path), 0o600)
+            except Exception as e:
+                return jsonify({
+                    "success": False,
+                    "message": f"Failed to save {field}: {e}",
+                }), 500
+
+            state.config[f"{kind}_credentials_file"] = str(fixed_path)
             current_app.logger.info(
                 f"[{sid}] {field} overwritten → "
                 f"uploads/credential/{kind}_credentials.json"
             )
-        else:
-            # No new file this request — check the fixed path still exists on disk
-            existing = (
-                state.SOURCE_CREDENTIALS_PATH if kind == "source"
-                else state.DEST_CREDENTIALS_PATH
-            )
-            if not existing.exists():
-                return jsonify({
-                    "success": False,
-                    "message": (
-                        f"{field} is required — no existing file found at "
-                        f"uploads/credential/{kind}_credentials.json"
-                    ),
-                }), 400
-            # Re-point state at the existing file (survives page refresh)
-            state.config[f"{kind}_credentials_file"] = str(existing)
+
+        elif fixed_path.exists():
+            # No new file uploaded — re-use the existing file on disk.
+            # On PUT this is expected; on POST it means the user skipped
+            # re-uploading a file they already uploaded in a previous session.
+            state.config[f"{kind}_credentials_file"] = str(fixed_path)
+
+        elif not is_update:
+            # POST with no file and nothing on disk — hard error.
+            return jsonify({
+                "success": False,
+                "message": (
+                    f"{field} is required — "
+                    f"no existing file found at "
+                    f"uploads/credential/{kind}_credentials.json. "
+                    f"Please upload the credential file."
+                ),
+            }), 400
+
+        # PUT with no file and nothing on disk — silently skip.
+        # The caller is responsible for ensuring credentials exist before
+        # proceeding to /api/validate.
 
     _apply_config_to_backend()
 
     return jsonify({
         "success":   True,
         "sessionId": sid,
-        "message":   "Configuration saved.",
+        "message":   "Configuration updated." if is_update else "Configuration saved.",
     })
 
 
@@ -138,8 +196,11 @@ def validate_connection():
         state.new_session(sid, auto_delete_previous=False)
 
     if not _backend_available():
-        return jsonify({"source": False, "destination": False,
-                        "errors": ["Backend repo not found."]}), 500
+        return jsonify({
+            "source":      False,
+            "destination": False,
+            "errors":      ["Backend repo not found."],
+        }), 500
 
     # Check fixed credential files exist before attempting auth
     creds = state.credentials_exist()
@@ -153,7 +214,9 @@ def validate_connection():
             "errors":      [f"Missing credential file(s): {', '.join(missing)}"],
         }), 400
 
-    errors = []; source_ok = False; dest_ok = False
+    errors = []
+    source_ok = False
+    dest_ok   = False
 
     try:
         _ensure_backend_on_path()
@@ -193,7 +256,11 @@ def validate_connection():
     except Exception as e:
         errors.append(f"Error: {e}")
 
-    return jsonify({"source": source_ok, "destination": dest_ok, "errors": errors})
+    return jsonify({
+        "source":      source_ok,
+        "destination": dest_ok,
+        "errors":      errors,
+    })
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -241,15 +308,18 @@ def save_migration_mode():
 def _backend_available() -> bool:
     return BACKEND_DIR.exists()
 
+
 def _ensure_backend_on_path():
     s = str(BACKEND_DIR)
     if s not in sys.path:
         sys.path.insert(0, s)
 
+
 def _apply_config_to_backend():
     """
     Override hardcoded values in amey/config.py at runtime.
-    The file on disk is NEVER modified — only the in-process Config class.
+    Falls back to fixed disk paths for credentials if in-memory state
+    was wiped by a gunicorn worker restart.
     """
     if not _backend_available():
         return
@@ -257,13 +327,29 @@ def _apply_config_to_backend():
     try:
         import config as bc
         cfg = bc.Config
+
+        # ── Credential paths: use memory value if set, else fall back to
+        #    the fixed absolute paths on disk. This survives worker restarts.
+        src_creds = (
+            state.config.get("source_credentials_file")
+            or str(state.SOURCE_CREDENTIALS_PATH)
+        )
+        dst_creds = (
+            state.config.get("dest_credentials_file")
+            or str(state.DEST_CREDENTIALS_PATH)
+        )
+
+        # Always set credential paths — even if domain fields are empty
+        cfg.SOURCE_CREDENTIALS_FILE = src_creds
+        cfg.DEST_CREDENTIALS_FILE   = dst_creds
+
         if state.config.get("source_domain"):
-            cfg.SOURCE_DOMAIN           = state.config["source_domain"]
-            cfg.SOURCE_ADMIN_EMAIL      = state.config["source_admin_email"]
-            cfg.SOURCE_CREDENTIALS_FILE = state.config["source_credentials_file"]
+            cfg.SOURCE_DOMAIN      = state.config["source_domain"]
+            cfg.SOURCE_ADMIN_EMAIL = state.config["source_admin_email"]
+
         if state.config.get("dest_domain"):
-            cfg.DEST_DOMAIN           = state.config["dest_domain"]
-            cfg.DEST_ADMIN_EMAIL      = state.config["dest_admin_email"]
-            cfg.DEST_CREDENTIALS_FILE = state.config["dest_credentials_file"]
+            cfg.DEST_DOMAIN      = state.config["dest_domain"]
+            cfg.DEST_ADMIN_EMAIL = state.config["dest_admin_email"]
+
     except Exception as e:
         current_app.logger.warning(f"Config patch failed: {e}")

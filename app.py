@@ -13,6 +13,7 @@ from routes.config_routes import config_bp
 from routes.migration_routes import migration_bp
 from routes.status_routes import status_bp
 from routes.auth_routes import auth_bp 
+from routes.preflight_routes import preflight_bp 
 
 def create_app():
     app = Flask(__name__)
@@ -33,7 +34,7 @@ def create_app():
     app.register_blueprint(config_bp,    url_prefix="/api")
     app.register_blueprint(migration_bp, url_prefix="/api")
     app.register_blueprint(status_bp,    url_prefix="/api")
-
+    app.register_blueprint(preflight_bp, url_prefix="/api")
     return app
 
 
