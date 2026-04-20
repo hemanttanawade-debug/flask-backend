@@ -1,10 +1,10 @@
 """
 routes/migration_routes.py
 
-  POST /api/user-mapping             — upload CSV (any filename → saved as users.csv)
+  POST /api/user-mapping             — upload CSV → always saved as uploads/users.csv
   POST /api/migrate                  — start migration in background thread
   POST /api/migration/<id>/retry     — retry failed files
-  DELETE /api/migration/<id>/cleanup — delete this session's uploaded files
+  DELETE /api/migration/<id>/cleanup — resets in-memory state (files kept on disk)
 """
 
 import csv
@@ -16,11 +16,12 @@ import threading
 import traceback
 from pathlib import Path
 from flask import Blueprint, request, jsonify
+from routes.auth_routes import require_auth
 
 import session_state as state
 
 migration_bp = Blueprint("migration", __name__)
-BACKEND_DIR  = BACKEND_DIR = Path.home() / "amey"
+BACKEND_DIR  = Path.home() / "amey"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -28,36 +29,39 @@ BACKEND_DIR  = BACKEND_DIR = Path.home() / "amey"
 # ─────────────────────────────────────────────────────────────────────────────
 
 @migration_bp.route("/user-mapping", methods=["POST"])
+@require_auth
 def upload_user_mapping():
     """
-    Accepts any CSV file from the user.
-    Saved as uploads/<sessionId>/users.csv regardless of original filename.
-    Returns parsed preview for the frontend table.
+    Accepts multipart/form-data:
+      - file       (required) — CSV with 'source' and 'destination' columns
+      - sessionId  (optional) — reconciles session if different from current
 
-    Expected columns: source, destination[, source_drive_id, dest_drive_id]
+    Always saved as uploads/users.csv — overwrites any previous upload.
+    The user's original filename is ignored.
     """
+    sid = request.form.get("sessionId") or state.session_id
+    if sid and sid != state.session_id:
+        state.new_session(sid, auto_delete_previous=False)
+
     file = request.files.get("file")
     if not file or not file.filename:
         return jsonify({"error": "No file provided"}), 400
     if not file.filename.lower().endswith(".csv"):
         return jsonify({"error": "Only CSV files are accepted"}), 400
 
-    sid         = state.session_id or "default"
-    session_dir = state.UPLOAD_DIR / sid
-    session_dir.mkdir(parents=True, exist_ok=True)
-
-    # Always save as fixed name — user's filename is ignored
-    csv_path = session_dir / "users.csv"
-    file.save(str(csv_path))
-    state.csv_file_path = str(csv_path)
+    # Save to fixed path — overwrites previous CSV
+    csv_path = state.save_csv_file(file)
+    state.csv_file_path = csv_path
 
     try:
-        content    = csv_path.read_text(encoding="utf-8-sig")
+        content    = Path(csv_path).read_text(encoding="utf-8-sig")
         reader     = csv.DictReader(io.StringIO(content))
         fieldnames = [f.strip().lower() for f in (reader.fieldnames or [])]
 
         if "source" not in fieldnames or "destination" not in fieldnames:
-            return jsonify({"error": "CSV must have 'source' and 'destination' columns."}), 400
+            return jsonify({
+                "error": "CSV must have 'source' and 'destination' columns."
+            }), 400
 
         mappings = []
         for row in reader:
@@ -79,13 +83,26 @@ def upload_user_mapping():
 # ─────────────────────────────────────────────────────────────────────────────
 
 @migration_bp.route("/migrate", methods=["POST"])
+@require_auth
 def start_migration():
-    """Body: { "mode": "full|custom|shared-drives|resume", "migrationId": "<id>" }"""
+    """
+    Body (JSON): { "sessionId": "<sid>", "mode": "full|custom|shared-drives|resume",
+                   "migrationId": "<id>"  ← optional, for resume }
+
+    Mode falls back to state.config["migration_mode"] (saved by Step 3).
+    """
     if state.migration["status"] == "running":
         return jsonify({"error": "A migration is already running."}), 409
 
-    body         = request.get_json(silent=True) or {}
-    mode         = body.get("mode", "full")
+    body = request.get_json(silent=True) or {}
+
+    sid = body.get("sessionId") or state.session_id
+    if sid and sid != state.session_id:
+        state.new_session(sid, auto_delete_previous=False)
+
+    # Prefer body mode → fall back to what Step 3 stored
+    mode = (body.get("mode") or state.config.get("migration_mode") or "full").strip()
+
     resume_id    = body.get("migrationId")
     migration_id = resume_id or str(uuid.uuid4())
 
@@ -104,6 +121,7 @@ def start_migration():
     )
     thread.start()
     state._migration_thread = thread
+
     return jsonify({"migrationId": migration_id})
 
 
@@ -112,6 +130,7 @@ def start_migration():
 # ─────────────────────────────────────────────────────────────────────────────
 
 @migration_bp.route("/migration/<migration_id>/retry", methods=["POST"])
+@require_auth
 def retry_failed(migration_id: str):
     if state.migration["status"] == "running":
         return jsonify({"success": False, "error": "Migration already running."}), 409
@@ -132,33 +151,33 @@ def retry_failed(migration_id: str):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @migration_bp.route("/migration/<migration_id>/cleanup", methods=["DELETE"])
+@require_auth
 def cleanup(migration_id: str):
     """
-    Deletes uploaded files for the session tied to this migration.
-    Use this when a migration is done and you want to start fresh.
-    Safe to call even if files are already gone.
+    Resets in-memory migration state.
+    Credential files are NOT deleted — they live at fixed paths and are
+    only replaced by uploading new ones through Step 0.
     """
     if state.migration["status"] == "running" and \
        state.migration["migration_id"] == migration_id:
-        return jsonify({"success": False,
-                        "error": "Cannot delete files while migration is running."}), 409
+        return jsonify({
+            "success": False,
+            "error":   "Cannot reset while migration is running.",
+        }), 409
 
-    # Find the session_id from history or current state
-    sid = None
-    if state.migration.get("migration_id") == migration_id:
-        sid = state.migration.get("session_id")
-    elif migration_id in state.all_migrations:
-        sid = state.all_migrations[migration_id].get("session_id")
+    state.migration.update({
+        "migration_id":   None,
+        "session_id":     None,
+        "status":         "idle",
+        "total_users":    0,
+        "files_migrated": 0,
+        "failed_files":   0,
+        "logs":           [],
+    })
 
-    if not sid:
-        return jsonify({"success": False,
-                        "error": "Migration ID not found or no files to delete."}), 404
-
-    deleted = state.cleanup_session_files(sid)
     return jsonify({
         "success": True,
-        "deleted": deleted,
-        "message": f"Cleaned up files for session {sid}. Ready for new migration.",
+        "message": "Migration state reset. Credential files retained on disk.",
     })
 
 
@@ -168,11 +187,8 @@ def cleanup(migration_id: str):
 
 def _run_migration(mode: str, migration_id: str, resume_id: str | None):
     """
-    Mirrors main.py exactly:
-      _build_auth_manager()     → DomainAuthManager(source_config, dest_config, scopes)
-      _get_user_mapping()       → UserManager(src_admin, dst_admin, src_domain, dst_domain)
-      _build_migration_engine() → MigrationEngine(source_auth, dest_auth, config,
-                                    checkpoint, gcs_helper, run_id, get_conn)
+    All config was already persisted across wizard steps — just read from
+    state.config here. Credential files are at their fixed paths.
     """
     def log(msg: str):
         state.migration["logs"].append(msg)
@@ -221,8 +237,9 @@ def _run_migration(mode: str, migration_id: str, resume_id: str | None):
             )
 
             if mode == "custom":
-                if not state.csv_file_path:
-                    log("[ERROR] No CSV uploaded. Upload a user mapping file first.")
+                csv_path = state.csv_file_path
+                if not csv_path or not Path(csv_path).exists():
+                    log("[ERROR] No CSV found at uploads/users.csv — upload a mapping file first.")
                     state.migration["status"] = "failed"
                     return
 
@@ -232,10 +249,10 @@ def _run_migration(mode: str, migration_id: str, resume_id: str | None):
                     src_svc["admin"], dst_svc["admin"],
                     Config.SOURCE_DOMAIN, Config.DEST_DOMAIN,
                 )
-                result       = user_mgr.import_mapping(state.csv_file_path)
+                result       = user_mgr.import_mapping(csv_path)
                 user_mapping = result.user_mapping
                 state.migration["total_users"] = len(user_mapping)
-                log(f"[INFO] {len(user_mapping)} user(s) loaded from users.csv")
+                log(f"[INFO] {len(user_mapping)} user(s) loaded from uploads/users.csv")
                 engine.migrate_users(user_mapping, run_id=migration_id)
 
             elif mode == "full":
@@ -249,6 +266,11 @@ def _run_migration(mode: str, migration_id: str, resume_id: str | None):
         elif mode == "shared-drives":
             from shared_drive_migrator import SharedDriveMigrator
             SharedDriveMigrator(auth, Config).migrate_all(run_id=migration_id)
+
+        else:
+            log(f"[ERROR] Unknown mode: {mode}")
+            state.migration["status"] = "failed"
+            return
 
         state.migration["status"] = "completed"
         log("[INFO] ✅ Migration completed successfully.")

@@ -13,7 +13,7 @@ if not CLIENT_ID:
 
 ALLOWED_USERS = [
     "hemant@dev.shivaami.in",
-    "uzer@dev.shivaami.in",
+    "uzer@dev.shivaami.in","hemant.tanawade@shivaami.com"
 ]
 
 def require_auth(f):

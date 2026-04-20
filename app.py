@@ -19,7 +19,13 @@ def create_app():
     app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB max upload
 
     # Allow requests from the React frontend (Vite dev server + production)
-    CORS(app, resources={r"/api/*": {"origins": ["https://migration.shivaami.in"]}})
+    # Fix
+    CORS(app, resources={r"/api/*": {
+    "origins": ["https://migration.shivaami.in"],
+    "allow_headers": ["Authorization", "Content-Type"],
+    "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    "supports_credentials": True
+    }})
 
 
     # Register blueprints
