@@ -1,8 +1,8 @@
 """
 routes/config_routes.py
 
-  POST /api/config/new        — start a new wizard session (resets in-memory state only)
-  POST /api/config            — save domain config + credential files (first time)
+  POST /api/config/new        — no-op if session exists; creates one only on first boot / after reset
+  POST /api/config            — save domain config + credential files
   PUT  /api/config            — update domain config; credential files optional
   POST /api/validate          — test source/dest connectivity
   POST /api/migration-mode    — save chosen migration mode for this session
@@ -28,15 +28,16 @@ BACKEND_DIR = Path.home() / "amey"
 @require_auth
 def new_session():
     """
-    Resets in-memory wizard state and returns a fresh sessionId.
-    Credential files on disk are NOT deleted — they will be overwritten
-    only when the user explicitly uploads new ones in Step 0.
+    Returns the current session_id (or creates one if none exists yet).
+
+    CHANGED: this route no longer resets domain/email/CSV/credential state.
+    State persists across page refreshes and VM restarts.
+    The only way to clear state is DELETE /api/reset.
     """
-    sid = str(uuid.uuid4())
-    state.new_session(sid, auto_delete_previous=False)
+    state.new_session()   # no-op if session already exists
     return jsonify({
-        "sessionId": sid,
-        "message":   "New migration session started.",
+        "sessionId": state.session_id,
+        "message":   "Session ready.",
     })
 
 
@@ -50,35 +51,24 @@ def new_session():
 def save_config():
     """
     Accepts multipart/form-data:
-      - sessionId                  (from /api/config/new)
+      - sessionId                  (ignored — current session is always used)
       - sourceDomain, sourceAdminEmail
       - destinationDomain, destinationAdminEmail
       - sourceCredentials          (.json) → overwrites uploads/credential/source_credentials.json
       - destinationCredentials     (.json) → overwrites uploads/credential/dest_credentials.json
 
     POST  — credential files required if they don't already exist on disk.
-    PUT   — credential files are optional; existing files on disk are kept as-is
-            if no new file is uploaded (allows updating only domain/email fields).
+    PUT   — credential files are optional; existing files on disk are kept as-is.
 
-    KEY FIX — ERR_UPLOAD_FILE_CHANGED:
-      The browser throws this when it tries to re-read a file that changed on
-      disk after the user selected it. We fix this by calling file.read() to
-      pull ALL bytes into memory immediately, then writing from that buffer —
-      so Flask never touches the original file handle again.
-
-    Files are ALWAYS saved to the same fixed paths — never in session subfolders.
-    The user's original filename is ignored.
-    File contents are never logged or returned.
+    All changes are immediately persisted to uploads/session.json so they
+    survive a VM restart or gunicorn reload.
     """
     is_update = request.method == "PUT"
     form      = request.form
     files     = request.files
 
-    sid = form.get("sessionId") or state.session_id
-    if not sid:
-        sid = str(uuid.uuid4())
-    if sid != state.session_id:
-        state.new_session(sid, auto_delete_previous=False)
+    # Ensure a session exists (idempotent)
+    state.new_session()
 
     required_fields = [
         "sourceDomain", "sourceAdminEmail",
@@ -91,7 +81,7 @@ def save_config():
             "message": f"Missing fields: {', '.join(missing)}",
         }), 400
 
-    # Persist domain / email fields in memory
+    # Update domain / email fields in memory
     state.config["source_domain"]      = form["sourceDomain"]
     state.config["source_admin_email"] = form["sourceAdminEmail"]
     state.config["dest_domain"]        = form["destinationDomain"]
@@ -109,10 +99,7 @@ def save_config():
         )
 
         if file and file.filename:
-            # ── Read ALL bytes into memory immediately ────────────────────────
-            # Fix for ERR_UPLOAD_FILE_CHANGED: once bytes are in a Python
-            # variable the browser file handle is no longer needed — we write
-            # from our own in-memory buffer, immune to on-disk changes.
+            # Read ALL bytes into memory immediately to avoid ERR_UPLOAD_FILE_CHANGED
             try:
                 file_bytes = file.read()
             except Exception as e:
@@ -131,7 +118,6 @@ def save_config():
                     "message": f"{field}: uploaded file is empty.",
                 }), 400
 
-            # Write from in-memory buffer — immune to subsequent on-disk changes
             try:
                 state.CREDENTIAL_DIR.mkdir(parents=True, exist_ok=True)
                 fixed_path.write_bytes(file_bytes)
@@ -144,18 +130,14 @@ def save_config():
 
             state.config[f"{kind}_credentials_file"] = str(fixed_path)
             current_app.logger.info(
-                f"[{sid}] {field} overwritten → "
+                f"[{state.session_id}] {field} overwritten → "
                 f"uploads/credential/{kind}_credentials.json"
             )
 
         elif fixed_path.exists():
-            # No new file uploaded — re-use the existing file on disk.
-            # On PUT this is expected; on POST it means the user skipped
-            # re-uploading a file they already uploaded in a previous session.
             state.config[f"{kind}_credentials_file"] = str(fixed_path)
 
         elif not is_update:
-            # POST with no file and nothing on disk — hard error.
             return jsonify({
                 "success": False,
                 "message": (
@@ -166,15 +148,15 @@ def save_config():
                 ),
             }), 400
 
-        # PUT with no file and nothing on disk — silently skip.
-        # The caller is responsible for ensuring credentials exist before
-        # proceeding to /api/validate.
+    # ── Persist all changes to disk ───────────────────────────────────────────
+    state._persist()
+    # ─────────────────────────────────────────────────────────────────────────
 
     _apply_config_to_backend()
 
     return jsonify({
         "success":   True,
-        "sessionId": sid,
+        "sessionId": state.session_id,
         "message":   "Configuration updated." if is_update else "Configuration saved.",
     })
 
@@ -187,14 +169,9 @@ def save_config():
 @require_auth
 def validate_connection():
     """
-    Accepts JSON body: { "sessionId": "<sid>" }
+    Accepts JSON body: { "sessionId": "<sid>" }  (sessionId is now ignored)
     Pings both domains using the credential files at their fixed paths.
     """
-    body = request.get_json(silent=True) or {}
-    sid  = body.get("sessionId") or state.session_id
-    if sid and sid != state.session_id:
-        state.new_session(sid, auto_delete_previous=False)
-
     if not _backend_available():
         return jsonify({
             "source":      False,
@@ -202,7 +179,6 @@ def validate_connection():
             "errors":      ["Backend repo not found."],
         }), 500
 
-    # Check fixed credential files exist before attempting auth
     creds = state.credentials_exist()
     if not creds["source"] or not creds["dest"]:
         missing = []
@@ -214,7 +190,7 @@ def validate_connection():
             "errors":      [f"Missing credential file(s): {', '.join(missing)}"],
         }), 400
 
-    errors = []
+    errors    = []
     source_ok = False
     dest_ok   = False
 
@@ -271,14 +247,12 @@ def validate_connection():
 @require_auth
 def save_migration_mode():
     """
-    Accepts JSON body: { "sessionId": "<sid>", "mode": "full|custom|shared-drives|resume" }
-    Persists the chosen mode into state so /api/migrate can read it without
-    the frontend needing to send it again.
+    Accepts JSON body: { "mode": "full|custom|shared-drives|resume" }
+    Persists the chosen mode into state AND to disk.
     """
     body = request.get_json(silent=True) or {}
-    sid  = body.get("sessionId") or state.session_id
-    if sid and sid != state.session_id:
-        state.new_session(sid, auto_delete_previous=False)
+
+    state.new_session()   # idempotent
 
     mode = body.get("mode", "").strip()
     valid_modes = {"full", "custom", "shared-drives", "resume"}
@@ -291,13 +265,40 @@ def save_migration_mode():
             ),
         }), 400
 
-    state.config["migration_mode"] = mode
-    current_app.logger.info(f"[{sid}] Migration mode set to: {mode}")
+    # update_config persists to disk automatically
+    state.update_config(migration_mode=mode)
+    current_app.logger.info(f"[{state.session_id}] Migration mode set to: {mode}")
 
     return jsonify({
         "success": True,
         "mode":    mode,
         "message": f"Migration mode '{mode}' saved.",
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /api/config/current  — frontend can read back persisted state
+# ─────────────────────────────────────────────────────────────────────────────
+
+@config_bp.route("/config/current", methods=["GET"])
+@require_auth
+def get_current_config():
+    """
+    Returns the current persisted wizard state (no credential contents).
+    Useful for the frontend to re-hydrate forms after a page reload.
+    """
+    return jsonify({
+        "sessionId":            state.session_id,
+        "sourceDomain":         state.config.get("source_domain",      ""),
+        "sourceAdminEmail":     state.config.get("source_admin_email", ""),
+        "destinationDomain":    state.config.get("dest_domain",        ""),
+        "destinationAdminEmail":state.config.get("dest_admin_email",   ""),
+        "migrationMode":        state.config.get("migration_mode",     "full"),
+        "lastDiscoveryRunId":   state.config.get("last_discovery_run_id", ""),
+        "sourceCredExists":     state.SOURCE_CREDENTIALS_PATH.exists(),
+        "destCredExists":       state.DEST_CREDENTIALS_PATH.exists(),
+        "csvExists":            state.CSV_PATH.exists(),
+        "migrationActive":      state.is_migration_active(),
     })
 
 
@@ -328,8 +329,6 @@ def _apply_config_to_backend():
         import config as bc
         cfg = bc.Config
 
-        # ── Credential paths: use memory value if set, else fall back to
-        #    the fixed absolute paths on disk. This survives worker restarts.
         src_creds = (
             state.config.get("source_credentials_file")
             or str(state.SOURCE_CREDENTIALS_PATH)
@@ -339,7 +338,6 @@ def _apply_config_to_backend():
             or str(state.DEST_CREDENTIALS_PATH)
         )
 
-        # Always set credential paths — even if domain fields are empty
         cfg.SOURCE_CREDENTIALS_FILE = src_creds
         cfg.DEST_CREDENTIALS_FILE   = dst_creds
 

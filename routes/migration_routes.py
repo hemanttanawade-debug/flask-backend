@@ -483,13 +483,52 @@ def _run_migration_bg(run_id, user_mapping, folder_workers, global_workers, q):
 def _load_run_from_sql(run_id: str):
     """
     Rebuild user_mapping from migration_items and return pending/done counts.
+
+    FIX-1: Uses a retry loop (up to 3 attempts) around Config.get_db_connection()
+            so a transient connection failure doesn't silently block resume.
+
+    FIX-2: Resets any IN_PROGRESS rows back to PENDING before counting.
+            Files that were mid-transfer when the server crashed are stuck as
+            IN_PROGRESS forever — get_all_pending_items() only fetches
+            PENDING/FAILED, so they would never be retried without this reset.
+
     Returns: (user_mapping, pending_count, done_count)
     """
+    import time as _time
     from config import Config
 
-    conn = Config.get_db_connection()
+    last_exc = None
+    for attempt in range(3):
+        try:
+            conn = Config.get_db_connection()
+            break
+        except Exception as exc:
+            last_exc = exc
+            if attempt < 2:
+                _time.sleep(2 ** attempt)
+    else:
+        raise RuntimeError(
+            f"Could not connect to DB after 3 attempts: {last_exc}"
+        )
+
     try:
         cur = conn.cursor(dictionary=True)
+
+        # ── FIX-2: reset IN_PROGRESS → PENDING so crashed files are retried ──
+        cur.execute("""
+            UPDATE migration_items
+               SET status = 'PENDING', error_message = NULL
+             WHERE migration_id = %s
+               AND status = 'IN_PROGRESS'
+               AND is_folder = 0
+        """, (run_id,))
+        reset_count = cur.rowcount
+        conn.commit()
+        if reset_count:
+            current_app.logger.warning(
+                f"[migration/resume] reset {reset_count} IN_PROGRESS → PENDING "
+                f"for run_id={run_id} (server likely crashed mid-transfer)"
+            )
 
         # Rebuild user mapping from distinct email pairs stored during discovery
         cur.execute("""
@@ -504,11 +543,13 @@ def _load_run_from_sql(run_id: str):
             if r.get("source_user_email") and r.get("destination_user_email")
         }
 
-        # Count pending vs done (files only, not folders)
+        # Count pending vs done (files only, not folders).
+        # After the reset above, IN_PROGRESS no longer exists — all crashedfiles
+        # are now PENDING and will be included in the pending counter correctly.
         cur.execute("""
             SELECT
-                SUM(status IN ('PENDING', 'FAILED', 'IN_PROGRESS')) AS pending,
-                SUM(status = 'DONE')                                AS done
+                SUM(status IN ('PENDING', 'FAILED')) AS pending,
+                SUM(status = 'DONE')                 AS done
               FROM migration_items
              WHERE migration_id = %s AND is_folder = 0
         """, (run_id,))
@@ -518,7 +559,10 @@ def _load_run_from_sql(run_id: str):
 
         return user_mapping, pending, done
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _fetch_all_runs_from_sql():

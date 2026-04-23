@@ -13,7 +13,12 @@ from routes.config_routes import config_bp
 from routes.migration_routes import migration_bp
 from routes.status_routes import status_bp
 from routes.auth_routes import auth_bp 
-from routes.preflight_routes import preflight_bp 
+from routes.preflight_routes import preflight_bp
+from routes.storage_routes import storage_bp
+from routes.discovery_routes import discovery_bp
+from routes.reset_routes import reset_bp
+from routes.export_routes import export_bp
+from routes.dashboard_routes import dashboard_bp
 
 def create_app():
     app = Flask(__name__)
@@ -35,6 +40,11 @@ def create_app():
     app.register_blueprint(migration_bp, url_prefix="/api")
     app.register_blueprint(status_bp,    url_prefix="/api")
     app.register_blueprint(preflight_bp, url_prefix="/api")
+    app.register_blueprint(storage_bp,   url_prefix="/api")
+    app.register_blueprint(discovery_bp, url_prefix="/api")
+    app.register_blueprint(reset_bp,     url_prefix="/api")
+    app.register_blueprint(export_bp,    url_prefix="/api")
+    app.register_blueprint(dashboard_bp, url_prefix="/api")
     return app
 
 
