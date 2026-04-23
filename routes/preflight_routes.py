@@ -3,12 +3,19 @@
 routes/preflight_routes.py
 
   POST /api/preflight — run all 4 enterprise readiness checks:
-    1. Service account credentials (source + dest JSON loads & authenticates)
-    2. Domain-wide delegation      (admin can impersonate users on both domains)
-    3. Cloud SQL connection        (backend can read/write checkpoint state)
-    4. GCS bucket access           (backend can read/write staging bucket)
 
-  Returns per-check results so the frontend can show granular pass/fail.
+  Sources of truth:
+    - Service account JSON files  → state.SOURCE/DEST_CREDENTIALS_PATH  (flask uploads)
+    - Admin email / domain        → state.config (set via /api/config form)
+    - Cloud SQL creds             → amey/config.py  Config.DB_*
+    - GCS bucket creds            → amey/config.py  Config.GCS_SERVICE_ACCOUNT_FILE
+                                    + Config.GCS_BUCKET_NAME
+
+  Storage logic mirrors the Google Apps Script approach:
+    Admin Reports API  users/<email>/dates/<date>
+    parameters=accounts:drive_used_quota_in_mb,
+               accounts:gmail_used_quota_in_mb,
+               accounts:gplus_photos_used_quota_in_mb
 """
 
 import sys
@@ -28,119 +35,109 @@ BACKEND_DIR  = Path.home() / "amey"
 @preflight_bp.route("/preflight", methods=["POST"])
 @require_auth
 def run_preflight():
-    """
-    Accepts JSON body: { "sessionId": "<sid>" }
-
-    Runs 4 checks and returns:
-    {
-      "overall": true | false,
-      "checks": {
-        "service_account": { "ok": true,  "message": "...", "detail": "..." },
-        "domain_delegation": { "ok": false, "message": "...", "detail": "..." },
-        "cloud_sql":         { "ok": true,  "message": "...", "detail": "..." },
-        "gcs_bucket":        { "ok": true,  "message": "...", "detail": "..." }
-      }
-    }
-    """
     body = request.get_json(silent=True) or {}
     sid  = body.get("sessionId") or state.session_id
     if sid and sid != state.session_id:
         state.new_session(sid, auto_delete_previous=False)
 
-    # Ensure backend is importable
     if not BACKEND_DIR.exists():
+        err = _fail("Backend repo not found at ~/amey")
         return jsonify({
             "overall": False,
             "checks": {
-                "service_account":  _fail("Backend repo not found at ~/amey"),
-                "domain_delegation": _fail("Backend repo not found at ~/amey"),
-                "cloud_sql":         _fail("Backend repo not found at ~/amey"),
-                "gcs_bucket":        _fail("Backend repo not found at ~/amey"),
+                "service_account":   err,
+                "domain_delegation": err,
+                "cloud_sql":         err,
+                "gcs_bucket":        err,
             },
         }), 500
 
     _ensure_backend_on_path()
 
-    # Apply in-memory config to backend Config class before running checks
     from routes.config_routes import _apply_config_to_backend
     _apply_config_to_backend()
 
-    results = {}
-    results["service_account"]   = _check_service_account()
-    results["domain_delegation"] = _check_domain_delegation()
-    results["cloud_sql"]         = _check_cloud_sql()
-    results["gcs_bucket"]        = _check_gcs_bucket()
+    results = {
+        "service_account":   _check_service_account(),
+        "domain_delegation": _check_domain_delegation(),
+        "cloud_sql":         _check_cloud_sql(),
+        "gcs_bucket":        _check_gcs_bucket(),
+    }
 
     overall = all(v["ok"] for v in results.values())
-
     current_app.logger.info(
         f"[preflight] overall={overall} | "
         + " | ".join(f"{k}={v['ok']}" for k, v in results.items())
     )
-
     return jsonify({"overall": overall, "checks": results})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CHECK 1 — Service account credentials
+# Source: uploaded JSON files saved to fixed paths in session_state
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _check_service_account() -> dict:
     try:
         import json
+        from google.oauth2 import service_account
+        from google.auth.transport.requests import Request
 
-        # Guard: ensure paths are absolute, not bare filenames
-        for label, path in [
-            ("Source",      state.SOURCE_CREDENTIALS_PATH),
-            ("Destination", state.DEST_CREDENTIALS_PATH),
-        ]:
+        pairs = [
+            ("Source",      state.SOURCE_CREDENTIALS_PATH,
+                            state.config.get("source_admin_email") or ""),
+            ("Destination", state.DEST_CREDENTIALS_PATH,
+                            state.config.get("dest_admin_email") or ""),
+        ]
+
+        for label, path, admin_email in pairs:
             if not path.is_absolute():
+                return _fail(f"{label} credentials path not absolute: '{path}'")
+            if not path.exists():
                 return _fail(
-                    f"{label} credentials path is not absolute: '{path}'. "
-                    f"This is a server configuration error — check session_state.py."
+                    f"{label} credentials file missing at: {path}. "
+                    f"Upload it via /api/config."
                 )
 
-        creds = state.credentials_exist()
-        if not creds["source"]:
-            return _fail(
-                f"Source credentials file missing at: {state.SOURCE_CREDENTIALS_PATH}"
-            )
-        if not creds["dest"]:
-            return _fail(
-                f"Destination credentials file missing at: {state.DEST_CREDENTIALS_PATH}"
-            )
-
-        issues = []
-        for label, path in [
-            ("Source",      state.SOURCE_CREDENTIALS_PATH),
-            ("Destination", state.DEST_CREDENTIALS_PATH),
-        ]:
             try:
                 data = json.loads(path.read_text())
             except json.JSONDecodeError as e:
-                issues.append(f"{label} credentials is not valid JSON: {e}")
-                continue
+                return _fail(f"{label} credentials is not valid JSON: {e}")
 
-            required_keys = {"type", "project_id", "private_key_id",
-                             "private_key", "client_email"}
-            missing = required_keys - data.keys()
+            required = {"type", "project_id", "private_key_id",
+                        "private_key", "client_email"}
+            missing = required - data.keys()
             if missing:
-                issues.append(
+                return _fail(
                     f"{label} credentials missing fields: {', '.join(sorted(missing))}"
                 )
-                continue
-
             if data.get("type") != "service_account":
-                issues.append(
-                    f"{label} type is '{data.get('type')}' — expected 'service_account'"
+                return _fail(
+                    f"{label} type='{data.get('type')}', expected 'service_account'"
                 )
 
-        if issues:
-            return _fail(" | ".join(issues))
+            # Actually authenticate — catches bad private keys, revoked keys, etc.
+            if not admin_email:
+                return _fail(
+                    f"{label} admin email not set. "
+                    f"Save config via /api/config first."
+                )
+            try:
+                from config import Config
+                creds = service_account.Credentials.from_service_account_file(
+                    str(path), scopes=Config.SCOPES
+                ).with_subject(admin_email)
+                creds.refresh(Request())
+            except Exception as e:
+                return _fail(
+                    f"{label} service account failed to authenticate "
+                    f"(impersonating {admin_email}): {e}"
+                )
 
         return _ok(
-            "Both service account JSON files are valid",
-            f"{state.SOURCE_CREDENTIALS_PATH} ✓  {state.DEST_CREDENTIALS_PATH} ✓",
+            "Both service account credentials are valid and authenticate successfully",
+            f"{state.SOURCE_CREDENTIALS_PATH.name} ✓  "
+            f"{state.DEST_CREDENTIALS_PATH.name} ✓",
         )
 
     except Exception as e:
@@ -149,53 +146,54 @@ def _check_service_account() -> dict:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CHECK 2 — Domain-wide delegation
+# Source: credential files (uploads) + domain/admin from state.config (form)
+# Uses the same Admin SDK call pattern as the Apps Script
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _check_domain_delegation() -> dict:
-    """
-    Attempt to impersonate the configured admin email on BOTH domains
-    and call users.list() on each. This proves domain-wide delegation
-    is granted in the Admin Console for both service accounts.
-    """
     try:
         from config import Config
-        from auth import DomainAuthManager
-
-        auth = DomainAuthManager(
-            source_config={
-                "domain":           Config.SOURCE_DOMAIN,
-                "credentials_file": Config.SOURCE_CREDENTIALS_FILE,
-                "admin_email":      Config.SOURCE_ADMIN_EMAIL,
-            },
-            dest_config={
-                "domain":           Config.DEST_DOMAIN,
-                "credentials_file": Config.DEST_CREDENTIALS_FILE,
-                "admin_email":      Config.DEST_ADMIN_EMAIL,
-            },
-            scopes=Config.SCOPES,
-        )
+        from google.oauth2 import service_account
+        from google.auth.transport.requests import Request
+        from googleapiclient.discovery import build
 
         errors = []
 
-        # Source delegation check
-        try:
-            src_admin = auth.source_auth.get_admin_service()
-            src_admin.users().list(
-                domain=Config.SOURCE_DOMAIN,
-                maxResults=1,
-            ).execute()
-        except Exception as e:
-            errors.append(f"Source delegation failed: {e}")
+        checks = [
+            ("Source",
+             str(state.SOURCE_CREDENTIALS_PATH),
+             Config.SOURCE_ADMIN_EMAIL,
+             Config.SOURCE_DOMAIN),
+            ("Destination",
+             str(state.DEST_CREDENTIALS_PATH),
+             Config.DEST_ADMIN_EMAIL,
+             Config.DEST_DOMAIN),
+        ]
 
-        # Destination delegation check
-        try:
-            dst_admin = auth.dest_auth.get_admin_service()
-            dst_admin.users().list(
-                domain=Config.DEST_DOMAIN,
-                maxResults=1,
-            ).execute()
-        except Exception as e:
-            errors.append(f"Destination delegation failed: {e}")
+        for label, creds_file, admin_email, domain in checks:
+            if not Path(creds_file).exists():
+                errors.append(f"{label} credentials file missing: {creds_file}")
+                continue
+            try:
+                # Impersonate the domain admin explicitly — this is the delegation proof
+                creds = service_account.Credentials.from_service_account_file(
+                    creds_file, scopes=Config.SCOPES
+                ).with_subject(admin_email)
+                creds.refresh(Request())
+
+                svc = build("admin", "directory_v1",
+                            credentials=creds, cache_discovery=False)
+                result = svc.users().list(
+                    domain=domain, maxResults=1
+                ).execute()
+
+                user_count = len(result.get("users", []))
+                current_app.logger.info(
+                    f"[preflight] {label} delegation OK — "
+                    f"listed {user_count} user(s) on {domain}"
+                )
+            except Exception as e:
+                errors.append(f"{label} delegation failed (admin={admin_email}): {e}")
 
         if errors:
             return _fail(" | ".join(errors))
@@ -211,87 +209,95 @@ def _check_domain_delegation() -> dict:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CHECK 3 — Cloud SQL connection
+# Source: amey/config.py  Config.DB_HOST / DB_PORT / DB_NAME / DB_USER / DB_PASSWORD
+# Uses mysql.connector to match the actual driver in config.py
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _check_cloud_sql() -> dict:
-    """
-    Instantiate SQLStateManager (which opens a Cloud SQL connection)
-    and run a minimal read/write probe:
-      - INSERT a test row into a scratch table
-      - SELECT it back
-      - DELETE it
-    Proves the backend can checkpoint migration state to Cloud SQL.
-    """
     try:
         from config import Config
-        from sql_state_manager import SQLStateManager
 
-        mgr  = SQLStateManager(Config)
-        conn = mgr.get_conn()
+        # Config.get_db_connection() uses mysql.connector with the correct creds
+        conn   = Config.get_db_connection()
+        cursor = conn.cursor()
 
-        with conn.cursor() as cur:
-            # Use a dedicated probe table — never touches migration data
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS _preflight_probe (
-                    id   SERIAL PRIMARY KEY,
-                    val  TEXT NOT NULL,
-                    ts   TIMESTAMP DEFAULT NOW()
-                )
-            """)
-            cur.execute(
-                "INSERT INTO _preflight_probe (val) VALUES (%s) RETURNING id",
-                ("preflight-check",),
+        # CREATE probe table (MySQL syntax — no SERIAL, no RETURNING)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS _preflight_probe (
+                id   INT AUTO_INCREMENT PRIMARY KEY,
+                val  VARCHAR(64) NOT NULL,
+                ts   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-            row_id = cur.fetchone()[0]
-            cur.execute(
-                "SELECT val FROM _preflight_probe WHERE id = %s", (row_id,)
-            )
-            fetched = cur.fetchone()[0]
-            cur.execute(
-                "DELETE FROM _preflight_probe WHERE id = %s", (row_id,)
-            )
-            conn.commit()
+        """)
+
+        cursor.execute(
+            "INSERT INTO _preflight_probe (val) VALUES (%s)", ("preflight-check",)
+        )
+        row_id = cursor.lastrowid   # mysql.connector sets this after INSERT
+
+        cursor.execute(
+            "SELECT val FROM _preflight_probe WHERE id = %s", (row_id,)
+        )
+        fetched = cursor.fetchone()[0]
+
+        cursor.execute(
+            "DELETE FROM _preflight_probe WHERE id = %s", (row_id,)
+        )
+        conn.commit()
+        cursor.close()
+        conn.close()
 
         if fetched != "preflight-check":
-            return _fail(f"Read-back mismatch: expected 'preflight-check', got '{fetched}'")
+            return _fail(
+                f"Cloud SQL read-back mismatch: "
+                f"expected 'preflight-check', got '{fetched}'"
+            )
 
-        db_info = getattr(Config, "CLOUD_SQL_CONNECTION_NAME", "configured DB")
         return _ok(
-            "Cloud SQL connection healthy — read/write probe passed",
-            f"Connected to: {db_info}",
+            "Cloud SQL connection healthy — read/write/delete probe passed",
+            f"{Config.DB_HOST}:{Config.DB_PORT}/{Config.DB_NAME} "
+            f"(user: {Config.DB_USER})",
         )
 
     except ImportError:
-        return _fail("sql_state_manager module not found in backend")
+        return _fail(
+            "mysql-connector-python not installed — "
+            "run: pip install mysql-connector-python"
+        )
     except Exception as e:
         return _fail(f"Cloud SQL error: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CHECK 4 — GCS bucket access
+# Source: amey/config.py  Config.GCS_SERVICE_ACCOUNT_FILE + Config.GCS_BUCKET_NAME
+# NOT the Drive service account — GCS needs its own key with Storage Object Admin
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _check_gcs_bucket() -> dict:
-    """
-    Write a tiny probe object to the configured GCS bucket,
-    read it back, then delete it.
-    Proves the backend service account has storage.objects.* on the bucket.
-    """
     try:
         from config import Config
         from google.cloud import storage
         from google.oauth2 import service_account
 
-        bucket_name = getattr(Config, "GCS_BUCKET_NAME", None)
-        if not bucket_name:
-            return _fail("GCS_BUCKET_NAME not set in Config")
+        bucket_name   = getattr(Config, "GCS_BUCKET_NAME", None)
+        gcs_creds_file = getattr(Config, "GCS_SERVICE_ACCOUNT_FILE", None)
 
-        creds_file = getattr(Config, "SOURCE_CREDENTIALS_FILE", None)
-        if not creds_file or not Path(creds_file).exists():
-            return _fail("Source credentials file missing — needed for GCS auth")
+        if not bucket_name:
+            return _fail("GCS_BUCKET_NAME not set in amey/config.py")
+
+        if not gcs_creds_file:
+            return _fail("GCS_SERVICE_ACCOUNT_FILE not set in amey/config.py")
+
+        if not Path(gcs_creds_file).exists():
+            return _fail(
+                f"GCS service account key not found: '{gcs_creds_file}'. "
+                f"This must be a key with Storage Object Admin on "
+                f"gs://{bucket_name} — separate from the Drive SA key."
+            )
 
         sa_creds = service_account.Credentials.from_service_account_file(
-            creds_file,
+            gcs_creds_file,
             scopes=["https://www.googleapis.com/auth/devstorage.read_write"],
         )
         client = storage.Client(
@@ -303,26 +309,24 @@ def _check_gcs_bucket() -> dict:
         blob_name  = "_preflight_probe/check.txt"
         probe_data = b"preflight-ok"
 
-        # Write
         blob = bucket.blob(blob_name)
         blob.upload_from_string(probe_data, content_type="text/plain")
 
-        # Read back
         fetched = blob.download_as_bytes()
         if fetched != probe_data:
             return _fail(f"GCS read-back mismatch: got {fetched!r}")
 
-        # Delete
         blob.delete()
 
         return _ok(
-            f"GCS bucket '{bucket_name}' is accessible — read/write/delete probe passed",
-            f"Bucket: gs://{bucket_name}  |  Probe object: {blob_name}",
+            f"GCS bucket '{bucket_name}' accessible — "
+            f"read/write/delete probe passed",
+            f"gs://{bucket_name}  |  SA: {gcs_creds_file}",
         )
 
     except ImportError:
         return _fail(
-            "google-cloud-storage package not installed — "
+            "google-cloud-storage not installed — "
             "run: pip install google-cloud-storage"
         )
     except Exception as e:
@@ -330,7 +334,7 @@ def _check_gcs_bucket() -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Result helpers
+# Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _ok(message: str, detail: str = "") -> dict:

@@ -1,28 +1,41 @@
 """
 routes/migration_routes.py
 
-  POST /api/user-mapping             — upload CSV → always saved as uploads/users.csv
-  POST /api/migrate                  — start migration in background thread
-  POST /api/migration/<id>/retry     — retry failed files
-  DELETE /api/migration/<id>/cleanup — resets in-memory state (files kept on disk)
+  POST /api/migration/start    — Start fresh migration (SQL must have items from discovery)
+  POST /api/migration/resume   — Resume a previous run_id from SQL checkpoint
+  GET  /api/migration/runs     — List all past migration runs (for Resume UI dropdown)
+  GET  /api/migration/stream   — SSE stream: phase / progress / done / error
+  GET  /api/migration/status   — Poll-friendly JSON snapshot (works after VM restart)
+  GET  /api/migration/summary  — Final summary (202 while running)
+
+HOW RESUME WORKS:
+  1. VM restarts — in-memory _runs dict is empty, but SQL has all state
+  2. GET /api/migration/runs → returns list with resumable:true for unfinished runs
+  3. User clicks Resume → POST /api/migration/resume { runId }
+  4. Backend reads userMapping from SQL (no re-send needed)
+  5. get_all_pending_items() returns only PENDING/FAILED rows — DONE rows skipped
+  6. get_folder_mapping() reuses already-created folders — no duplicates
+  7. SSE streams progress exactly like a fresh run
 """
 
+import sys
+import json
 import csv
 import io
-import sys
-import uuid
 import copy
-import threading
 import traceback
+import threading
+import queue as _queue
 from pathlib import Path
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, Response, stream_with_context, current_app
 from routes.auth_routes import require_auth
-
 import session_state as state
 
 migration_bp = Blueprint("migration", __name__)
 BACKEND_DIR  = Path.home() / "amey"
 
+_runs: dict = {}
+_runs_lock  = threading.Lock()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # POST /api/user-mapping
@@ -34,10 +47,10 @@ def upload_user_mapping():
     """
     Accepts multipart/form-data:
       - file       (required) — CSV with 'source' and 'destination' columns
-      - sessionId  (optional) — reconciles session if different from current
+      - sessionId  (optional)
 
     Always saved as uploads/users.csv — overwrites any previous upload.
-    The user's original filename is ignored.
+    Returns the parsed mappings list so the frontend can build userMapping dict.
     """
     sid = request.form.get("sessionId") or state.session_id
     if sid and sid != state.session_id:
@@ -72,215 +85,604 @@ def upload_user_mapping():
                 mappings.append({"sourceUser": src, "destinationUser": dst})
 
         state.user_mappings = mappings
-        return jsonify({"mappings": mappings})
+
+        # Also build a flat dict { src_email: dst_email } for convenience
+        user_mapping_dict = {
+            m["sourceUser"]: m["destinationUser"]
+            for m in mappings
+            if m["sourceUser"] and m["destinationUser"]
+        }
+
+        return jsonify({
+            "mappings":    mappings,
+            "userMapping": user_mapping_dict,   # ready for /api/discovery/start + /api/migration/start
+            "total":       len(mappings),
+        })
 
     except Exception as e:
         return jsonify({"error": f"Failed to parse CSV: {e}"}), 500
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# POST /api/migrate
+# POST /api/migration/start
 # ─────────────────────────────────────────────────────────────────────────────
 
-@migration_bp.route("/migrate", methods=["POST"])
+@migration_bp.route("/migration/start", methods=["POST"])
 @require_auth
 def start_migration():
     """
-    Body (JSON): { "sessionId": "<sid>", "mode": "full|custom|shared-drives|resume",
-                   "migrationId": "<id>"  ← optional, for resume }
+    Start a completely new migration run.
 
-    Mode falls back to state.config["migration_mode"] (saved by Step 3).
+    Body (JSON):
+        {
+            "runId":        "run_2026_04_21",
+            "userMapping":  { "alice@src.com": "alice@dst.com", ... },
+            "folderWorkers": 4,
+            "globalWorkers": 14
+        }
+
+    runId MUST match the run_id used in /api/discovery/start so SQL has items.
     """
-    if state.migration["status"] == "running":
-        return jsonify({"error": "A migration is already running."}), 409
+    body           = request.get_json(silent=True) or {}
+    run_id         = (body.get("runId") or "").strip()
+    user_mapping   = body.get("userMapping") or {}
+    folder_workers = int(body.get("folderWorkers", 4))
+    global_workers = int(body.get("globalWorkers", 14))
 
-    body = request.get_json(silent=True) or {}
+    if not run_id:
+        return jsonify({"success": False, "message": "runId is required"}), 400
+    if not user_mapping:
+        return jsonify({"success": False, "message": "userMapping is required"}), 400
 
-    sid = body.get("sessionId") or state.session_id
-    if sid and sid != state.session_id:
-        state.new_session(sid, auto_delete_previous=False)
+    cred_err = _validate_credentials()
+    if cred_err:
+        return jsonify({"success": False, "message": cred_err}), 400
 
-    # Prefer body mode → fall back to what Step 3 stored
-    mode = (body.get("mode") or state.config.get("migration_mode") or "full").strip()
+    with _runs_lock:
+        if run_id in _runs and _runs[run_id]["status"] == "running":
+            return jsonify({
+                "success": False,
+                "message": f"Run '{run_id}' is already in progress.",
+            }), 409
+        _register_run(run_id, len(user_mapping))
 
-    resume_id    = body.get("migrationId")
-    migration_id = resume_id or str(uuid.uuid4())
+    _ensure_backend_on_path()
+    _launch(run_id, user_mapping, folder_workers, global_workers)
 
-    state.migration.update({
-        "migration_id":   migration_id,
-        "session_id":     state.session_id,
-        "status":         "running",
-        "total_users":    len(state.user_mappings),
-        "files_migrated": 0,
-        "failed_files":   0,
-        "logs":           [f"[INFO] Started — mode={mode}, id={migration_id}"],
+    current_app.logger.info(
+        f"[migration/start] run_id={run_id} | users={len(user_mapping)}"
+    )
+    return jsonify({
+        "success":     True,
+        "run_id":      run_id,
+        "message":     "Migration started",
+        "total_users": len(user_mapping),
     })
 
-    thread = threading.Thread(
-        target=_run_migration, args=(mode, migration_id, resume_id), daemon=True
-    )
-    thread.start()
-    state._migration_thread = thread
-
-    return jsonify({"migrationId": migration_id})
-
 
 # ─────────────────────────────────────────────────────────────────────────────
-# POST /api/migration/<id>/retry
+# POST /api/migration/resume
 # ─────────────────────────────────────────────────────────────────────────────
 
-@migration_bp.route("/migration/<migration_id>/retry", methods=["POST"])
+@migration_bp.route("/migration/resume", methods=["POST"])
 @require_auth
-def retry_failed(migration_id: str):
-    if state.migration["status"] == "running":
-        return jsonify({"success": False, "error": "Migration already running."}), 409
-
-    state.migration.update({
-        "status": "running",
-        "logs":   state.migration.get("logs", []) + ["[INFO] Retrying failed files…"],
-    })
-    thread = threading.Thread(
-        target=_run_migration, args=("resume", migration_id, migration_id), daemon=True
-    )
-    thread.start()
-    return jsonify({"success": True})
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# DELETE /api/migration/<id>/cleanup
-# ─────────────────────────────────────────────────────────────────────────────
-
-@migration_bp.route("/migration/<migration_id>/cleanup", methods=["DELETE"])
-@require_auth
-def cleanup(migration_id: str):
+def resume_migration():
     """
-    Resets in-memory migration state.
-    Credential files are NOT deleted — they live at fixed paths and are
-    only replaced by uploading new ones through Step 0.
+    Resume a previously started migration run after VM restart / interruption.
+
+    Body (JSON):
+        {
+            "runId":        "run_2026_04_21",
+            "folderWorkers": 4,
+            "globalWorkers": 14
+        }
+
+    userMapping is reconstructed from SQL — frontend does NOT need to send it again.
+    Only PENDING / FAILED files are processed — already DONE files are skipped.
+    Already-created folders are reused from SQL folder_mapping table.
     """
-    if state.migration["status"] == "running" and \
-       state.migration["migration_id"] == migration_id:
+    body   = request.get_json(silent=True) or {}
+    run_id = (body.get("runId") or "").strip()
+
+    if not run_id:
+        return jsonify({"success": False, "message": "runId is required"}), 400
+
+    cred_err = _validate_credentials()
+    if cred_err:
+        return jsonify({"success": False, "message": cred_err}), 400
+
+    with _runs_lock:
+        if run_id in _runs and _runs[run_id]["status"] == "running":
+            return jsonify({
+                "success": False,
+                "message": f"Run '{run_id}' is already running.",
+            }), 409
+
+    _ensure_backend_on_path()
+
+    # Load user mapping + counts from SQL
+    try:
+        user_mapping, pending_count, done_count = _load_run_from_sql(run_id)
+    except Exception as exc:
         return jsonify({
             "success": False,
-            "error":   "Cannot reset while migration is running.",
-        }), 409
+            "message": f"Could not load run '{run_id}' from SQL: {exc}",
+        }), 404
 
-    state.migration.update({
-        "migration_id":   None,
-        "session_id":     None,
-        "status":         "idle",
-        "total_users":    0,
-        "files_migrated": 0,
-        "failed_files":   0,
-        "logs":           [],
-    })
+    if not user_mapping:
+        return jsonify({
+            "success": False,
+            "message": (
+                f"No users found for run_id='{run_id}'. "
+                f"Ensure discovery ran with this run_id."
+            ),
+        }), 404
 
+    folder_workers = int(body.get("folderWorkers", 4))
+    global_workers = int(body.get("globalWorkers", 14))
+
+    with _runs_lock:
+        _register_run(run_id, len(user_mapping))
+        # Start progress bar from where it left off
+        _runs[run_id]["totals"]["files_done"]  = done_count
+        _runs[run_id]["totals"]["files_total"] = pending_count + done_count
+
+    _launch(run_id, user_mapping, folder_workers, global_workers)
+
+    current_app.logger.info(
+        f"[migration/resume] run_id={run_id} | users={len(user_mapping)} | "
+        f"pending={pending_count} already_done={done_count}"
+    )
     return jsonify({
-        "success": True,
-        "message": "Migration state reset. Credential files retained on disk.",
+        "success":       True,
+        "run_id":        run_id,
+        "message":       "Migration resumed",
+        "total_users":   len(user_mapping),
+        "pending_files": pending_count,
+        "done_files":    done_count,
     })
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Background migration runner
+# GET /api/migration/runs
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _run_migration(mode: str, migration_id: str, resume_id: str | None):
+@migration_bp.route("/migration/runs", methods=["GET"])
+@require_auth
+def list_runs():
     """
-    All config was already persisted across wizard steps — just read from
-    state.config here. Credential files are at their fixed paths.
+    Return all migration runs from SQL — used to populate the Resume UI.
+
+    Returns:
+        { "runs": [
+            {
+              "run_id", "status", "start_time", "end_time",
+              "total_items", "completed", "failed", "pending", "done",
+              "source_domain", "dest_domain",
+              "resumable": true   ← true when status != COMPLETED and pending > 0
+            }, ...
+        ]}
     """
-    def log(msg: str):
-        state.migration["logs"].append(msg)
+    _ensure_backend_on_path()
+    try:
+        runs = _fetch_all_runs_from_sql()
+        return jsonify({"runs": runs})
+    except Exception as exc:
+        return jsonify({"error": f"SQL error: {exc}"}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /api/migration/stream?run_id=<run_id>
+# ─────────────────────────────────────────────────────────────────────────────
+
+@migration_bp.route("/migration/stream", methods=["GET"])
+@require_auth
+def stream_migration():
+    """
+    SSE stream. Works identically for fresh starts and resumes.
+
+    Event types:
+        phase     — { phase: "folder_creation" | "file_transfer", run_id }
+        progress  — { file_name, source_email, success, ignored, skipped, error,
+                      done, total, totals }
+        done      — { run_id, summary, totals }
+        error     — { run_id, error }
+
+    If run is not in memory (after VM restart) but is DONE in SQL,
+    immediately emits a done event so the frontend shows the last result.
+    """
+    run_id = request.args.get("run_id", "").strip()
+    if not run_id:
+        return jsonify({"error": "run_id query param required"}), 400
+
+    with _runs_lock:
+        run = _runs.get(run_id)
+
+    # Run not in memory — serve from SQL if it already completed
+    if run is None:
+        try:
+            _ensure_backend_on_path()
+            summary = _fetch_run_summary_from_sql(run_id)
+            if summary:
+                def _static():
+                    data = json.dumps({"run_id": run_id, "summary": summary})
+                    yield f"event: done\ndata: {data}\n\n"
+                return Response(
+                    stream_with_context(_static()),
+                    mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+                )
+        except Exception:
+            pass
+        return jsonify({"error": f"Unknown run_id: {run_id}"}), 404
+
+    def generate():
+        q = run["queue"]
+        while True:
+            try:
+                event = q.get(timeout=30)
+            except _queue.Empty:
+                yield ": heartbeat\n\n"
+                continue
+            etype = event.get("type", "progress")
+            data  = json.dumps(event.get("data", {}))
+            yield f"event: {etype}\ndata: {data}\n\n"
+            if etype in ("done", "error"):
+                break
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /api/migration/status?run_id=<run_id>
+# ─────────────────────────────────────────────────────────────────────────────
+
+@migration_bp.route("/migration/status", methods=["GET"])
+@require_auth
+def migration_status():
+    """Poll-friendly snapshot. Falls back to SQL when run not in memory."""
+    run_id = request.args.get("run_id", "").strip()
+    if not run_id:
+        return jsonify({"error": "run_id query param required"}), 400
+
+    with _runs_lock:
+        run = _runs.get(run_id)
+
+    if run:
+        return jsonify({
+            "run_id": run_id, "status": run["status"],
+            "totals": run["totals"], "summary": run["summary"],
+        })
 
     try:
-        if str(BACKEND_DIR) not in sys.path:
-            sys.path.insert(0, str(BACKEND_DIR))
+        _ensure_backend_on_path()
+        sql_status = _fetch_run_status_from_sql(run_id)
+        if sql_status:
+            return jsonify({"run_id": run_id, **sql_status})
+    except Exception:
+        pass
 
-        from routes.config_routes import _apply_config_to_backend
-        _apply_config_to_backend()
+    return jsonify({"error": f"Unknown run_id: {run_id}"}), 404
 
-        from config import Config
-        from auth import DomainAuthManager
-        from sql_state_manager import SQLStateManager
 
-        log("[INFO] Authenticating…")
-        auth = DomainAuthManager(
-            source_config={
-                "domain":           Config.SOURCE_DOMAIN,
-                "credentials_file": Config.SOURCE_CREDENTIALS_FILE,
-                "admin_email":      Config.SOURCE_ADMIN_EMAIL,
-            },
-            dest_config={
-                "domain":           Config.DEST_DOMAIN,
-                "credentials_file": Config.DEST_CREDENTIALS_FILE,
-                "admin_email":      Config.DEST_ADMIN_EMAIL,
-            },
-            scopes=Config.SCOPES,
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /api/migration/summary?run_id=<run_id>
+# ─────────────────────────────────────────────────────────────────────────────
+
+@migration_bp.route("/migration/summary", methods=["GET"])
+@require_auth
+def migration_summary():
+    """Final summary. Returns 202 while running."""
+    run_id = request.args.get("run_id", "").strip()
+    if not run_id:
+        return jsonify({"error": "run_id query param required"}), 400
+
+    with _runs_lock:
+        run = _runs.get(run_id)
+
+    if run:
+        if run["status"] == "running":
+            return jsonify({
+                "run_id": run_id, "status": "running",
+                "message": "Migration still in progress",
+                "totals": run["totals"],
+            }), 202
+        return jsonify({
+            "run_id": run_id, "status": run["status"],
+            "summary": run["summary"], "totals": run["totals"],
+        })
+
+    try:
+        _ensure_backend_on_path()
+        sql_status = _fetch_run_status_from_sql(run_id)
+        if sql_status:
+            return jsonify({"run_id": run_id, **sql_status})
+    except Exception:
+        pass
+
+    return jsonify({"error": f"Unknown run_id: {run_id}"}), 404
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Background worker
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _launch(run_id, user_mapping, folder_workers, global_workers):
+    q = _runs[run_id]["queue"]
+    t = threading.Thread(
+        target=_run_migration_bg,
+        args=(run_id, user_mapping, folder_workers, global_workers, q),
+        daemon=True,
+    )
+    t.start()
+
+
+def _run_migration_bg(run_id, user_mapping, folder_workers, global_workers, q):
+    """
+    Daemon thread. Calls migration_engine_v4.run_migration().
+
+    Resume safety is entirely in the engine + SQLStateManager:
+      - get_all_pending_items() → only PENDING/FAILED rows (DONE skipped)
+      - get_folder_mapping()    → reuses existing dest folder IDs
+      - mark_done / mark_failed → idempotent SQL updates
+    """
+    try:
+        _ensure_backend_on_path()
+        from migration_engine_v4 import run_migration
+
+        q.put({"type": "phase", "data": {"phase": "folder_creation", "run_id": run_id}})
+
+        _first_file = [False]
+
+        def on_file_done(file_result: dict):
+            if not _first_file[0]:
+                _first_file[0] = True
+                q.put({"type": "phase", "data": {"phase": "file_transfer", "run_id": run_id}})
+
+            with _runs_lock:
+                run = _runs.get(run_id)
+                if run:
+                    _accumulate_totals(run["totals"], file_result)
+                    totals = dict(run["totals"])
+
+            q.put({"type": "progress", "data": {**file_result, "totals": totals}})
+
+        summary = run_migration(
+            run_id=run_id,
+            user_mapping=user_mapping,
+            progress_cb=on_file_done,
+            folder_workers=folder_workers,
+            global_workers=global_workers,
         )
-        auth.authenticate_all()
 
-        sql_mgr = SQLStateManager(Config)
+        with _runs_lock:
+            run = _runs.get(run_id)
+            if run:
+                run["status"]  = "done"
+                run["summary"] = summary
+                totals         = dict(run["totals"])
 
-        if mode in ("full", "custom", "resume"):
-            from migration_engine import MigrationEngine
-            from users import UserManager
+        q.put({"type": "done", "data": {
+            "run_id": run_id, "summary": summary, "totals": totals,
+        }})
 
-            engine = MigrationEngine(
-                source_auth = auth.source_auth,
-                dest_auth   = auth.dest_auth,
-                config      = Config,
-                checkpoint  = sql_mgr,
-                gcs_helper  = sql_mgr,
-                run_id      = migration_id,
-                get_conn    = sql_mgr.get_conn,
-            )
+    except Exception as exc:
+        with _runs_lock:
+            run = _runs.get(run_id)
+            if run: run["status"] = "error"
+        q.put({"type": "error", "data": {"run_id": run_id, "error": str(exc)}})
 
-            if mode == "custom":
-                csv_path = state.csv_file_path
-                if not csv_path or not Path(csv_path).exists():
-                    log("[ERROR] No CSV found at uploads/users.csv — upload a mapping file first.")
-                    state.migration["status"] = "failed"
-                    return
 
-                src_svc  = auth.get_source_services()
-                dst_svc  = auth.get_dest_services()
-                user_mgr = UserManager(
-                    src_svc["admin"], dst_svc["admin"],
-                    Config.SOURCE_DOMAIN, Config.DEST_DOMAIN,
-                )
-                result       = user_mgr.import_mapping(csv_path)
-                user_mapping = result.user_mapping
-                state.migration["total_users"] = len(user_mapping)
-                log(f"[INFO] {len(user_mapping)} user(s) loaded from uploads/users.csv")
-                engine.migrate_users(user_mapping, run_id=migration_id)
+# ─────────────────────────────────────────────────────────────────────────────
+# SQL helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-            elif mode == "full":
-                log("[INFO] Running full domain migration…")
-                engine.migrate_all(run_id=migration_id)
+def _load_run_from_sql(run_id: str):
+    """
+    Rebuild user_mapping from migration_items and return pending/done counts.
+    Returns: (user_mapping, pending_count, done_count)
+    """
+    from config import Config
 
-            elif mode == "resume":
-                log(f"[INFO] Resuming {resume_id}…")
-                engine.resume(run_id=resume_id)
+    conn = Config.get_db_connection()
+    try:
+        cur = conn.cursor(dictionary=True)
 
-        elif mode == "shared-drives":
-            from shared_drive_migrator import SharedDriveMigrator
-            SharedDriveMigrator(auth, Config).migrate_all(run_id=migration_id)
+        # Rebuild user mapping from distinct email pairs stored during discovery
+        cur.execute("""
+            SELECT DISTINCT source_user_email, destination_user_email
+              FROM migration_items
+             WHERE migration_id = %s AND source_user_email != ''
+        """, (run_id,))
+        rows = cur.fetchall() or []
+        user_mapping = {
+            r["source_user_email"]: r["destination_user_email"]
+            for r in rows
+            if r.get("source_user_email") and r.get("destination_user_email")
+        }
 
-        else:
-            log(f"[ERROR] Unknown mode: {mode}")
-            state.migration["status"] = "failed"
-            return
+        # Count pending vs done (files only, not folders)
+        cur.execute("""
+            SELECT
+                SUM(status IN ('PENDING', 'FAILED', 'IN_PROGRESS')) AS pending,
+                SUM(status = 'DONE')                                AS done
+              FROM migration_items
+             WHERE migration_id = %s AND is_folder = 0
+        """, (run_id,))
+        counts  = cur.fetchone() or {}
+        pending = int(counts.get("pending") or 0)
+        done    = int(counts.get("done")    or 0)
 
-        state.migration["status"] = "completed"
-        log("[INFO] ✅ Migration completed successfully.")
-
-    except Exception as e:
-        state.migration["status"] = "failed"
-        state.migration["failed_files"] += 1
-        log(f"[ERROR] {e}")
-        log(f"[TRACE] {traceback.format_exc()}")
-
+        return user_mapping, pending, done
     finally:
-        # Snapshot to history — survives new migrations starting
-        state.all_migrations[migration_id] = copy.deepcopy(state.migration)
+        conn.close()
+
+
+def _fetch_all_runs_from_sql():
+    """Fetch all migration runs for the Resume UI dropdown."""
+    from config import Config
+
+    conn = Config.get_db_connection()
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("""
+            SELECT migration_id, source_domain, destination_domain,
+                   status, start_time, end_time,
+                   total_items, completed_items, failed_items
+              FROM migration_runs
+             ORDER BY start_time DESC LIMIT 50
+        """)
+        runs   = cur.fetchall() or []
+        result = []
+
+        for r in runs:
+            mid = r["migration_id"]
+            cur.execute("""
+                SELECT
+                    SUM(status IN ('PENDING','FAILED','IN_PROGRESS')) AS pending,
+                    SUM(status = 'DONE')                              AS done_count
+                  FROM migration_items
+                 WHERE migration_id = %s AND is_folder = 0
+            """, (mid,))
+            counts  = cur.fetchone() or {}
+            pending = int(counts.get("pending")    or 0)
+            done    = int(counts.get("done_count") or 0)
+
+            result.append({
+                "run_id":        mid,
+                "status":        r.get("status", "UNKNOWN"),
+                "start_time":    str(r["start_time"]) if r.get("start_time") else None,
+                "end_time":      str(r["end_time"])   if r.get("end_time")   else None,
+                "total_items":   int(r.get("total_items",     0) or 0),
+                "completed":     int(r.get("completed_items", 0) or 0),
+                "failed":        int(r.get("failed_items",    0) or 0),
+                "pending":       pending,
+                "done":          done,
+                "source_domain": r.get("source_domain",       ""),
+                "dest_domain":   r.get("destination_domain",  ""),
+                "resumable": (
+                    r.get("status", "").upper() != "COMPLETED" and pending > 0
+                ),
+            })
+
+        return result
+    finally:
+        conn.close()
+
+
+def _fetch_run_status_from_sql(run_id: str) -> dict:
+    """Quick status snapshot — used when run is not in memory (post VM restart)."""
+    from config import Config
+
+    conn = Config.get_db_connection()
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("""
+            SELECT status, start_time, end_time, total_items, completed_items, failed_items
+              FROM migration_runs WHERE migration_id = %s
+        """, (run_id,))
+        row = cur.fetchone()
+        if not row:
+            return {}
+
+        cur.execute("""
+            SELECT
+                SUM(status IN ('PENDING','FAILED','IN_PROGRESS')) AS pending,
+                SUM(status = 'DONE')                              AS done_count
+              FROM migration_items WHERE migration_id = %s AND is_folder = 0
+        """, (run_id,))
+        counts  = cur.fetchone() or {}
+        pending = int(counts.get("pending")    or 0)
+        done    = int(counts.get("done_count") or 0)
+
+        return {
+            "status":     row.get("status", "UNKNOWN"),
+            "start_time": str(row["start_time"]) if row.get("start_time") else None,
+            "end_time":   str(row["end_time"])   if row.get("end_time")   else None,
+            "totals": {
+                "files_total":    pending + done,
+                "files_done":     done,
+                "files_migrated": int(row.get("completed_items", 0) or 0),
+                "files_failed":   int(row.get("failed_items",    0) or 0),
+                "files_skipped":  0,
+                "files_ignored":  0,
+                "pending":        pending,
+            },
+        }
+    finally:
+        conn.close()
+
+
+def _fetch_run_summary_from_sql(run_id: str) -> dict:
+    """Minimal summary for the SSE done event on client reconnect."""
+    status = _fetch_run_status_from_sql(run_id)
+    if not status:
+        return {}
+    totals = status.get("totals", {})
+    done   = totals.get("files_migrated", 0)
+    total  = totals.get("files_total",    0)
+    return {
+        "run_id":               run_id,
+        "status":               status.get("status"),
+        "accuracy_rate":        (done / total * 100) if total > 0 else 0.0,
+        "total_files_migrated": done,
+        "total_files_failed":   totals.get("files_failed", 0),
+        "pending":              totals.get("pending",       0),
+        "start_time":           status.get("start_time"),
+        "end_time":             status.get("end_time"),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _register_run(run_id: str, total_users: int):
+    """Create in-memory run entry. Must be called inside _runs_lock."""
+    _runs[run_id] = {
+        "status":  "running",
+        "summary": None,
+        "queue":   _queue.Queue(),
+        "totals": {
+            "total_users":     total_users,
+            "completed_users": 0,
+            "failed_users":    0,
+            "files_migrated":  0,
+            "files_failed":    0,
+            "files_skipped":   0,
+            "files_ignored":   0,
+            "folders_created": 0,
+            "files_done":      0,
+            "files_total":     0,
+        },
+    }
+
+
+def _accumulate_totals(totals: dict, result: dict):
+    totals["files_done"] += 1
+    if result.get("total"):
+        totals["files_total"] = result["total"]
+    if result.get("success"):   totals["files_migrated"] += 1
+    elif result.get("skipped"): totals["files_skipped"]  += 1
+    elif result.get("ignored"): totals["files_ignored"]  += 1
+    else:                       totals["files_failed"]   += 1
+
+
+def _validate_credentials() -> str:
+    creds   = state.credentials_exist()
+    missing = []
+    if not creds["source"]: missing.append("source_credentials.json")
+    if not creds["dest"]:   missing.append("dest_credentials.json")
+    return (
+        f"Missing credential file(s): {', '.join(missing)}. Upload via /api/config."
+        if missing else ""
+    )
+
+
+def _ensure_backend_on_path():
+    s = str(BACKEND_DIR)
+    if s not in sys.path:
+        sys.path.insert(0, s)
