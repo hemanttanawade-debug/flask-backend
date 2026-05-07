@@ -23,37 +23,19 @@ import json
 import csv
 import io
 import copy
-import logging
 import traceback
 import threading
 import queue as _queue
-import secrets
-from datetime import datetime
 from pathlib import Path
-from flask import Blueprint, request, jsonify, Response, stream_with_context
+from flask import Blueprint, request, jsonify, Response, stream_with_context, current_app
 from routes.auth_routes import require_auth
 import session_state as state
 
 migration_bp = Blueprint("migration", __name__)
 BACKEND_DIR  = Path.home() / "amey"
 
-# Module-level logger — safe in ANY thread (no Flask app context needed).
-# Never use current_app.logger inside background threads or callbacks.
-logger = logging.getLogger(__name__)
-
-# Report directory — inside flask-backend/reports/ (same folder status_routes.py serves from)
-REPORT_DIR = Path(__file__).parent.parent / "reports"
-
 _runs: dict = {}
 _runs_lock  = threading.Lock()
-
-# ── Stream-token store ────────────────────────────────────────────────────────
-# EventSource cannot send Authorization headers, so the frontend POSTs to
-# /migration/stream-token (which IS protected by @require_auth) to exchange
-# its existing auth session for a short-lived one-time token.  It then appends
-# that token as ?token=<tok> when opening the EventSource SSE connection.
-_stream_tokens: dict = {}          # { token_str: {"run_id": run_id} }
-_stream_tokens_lock  = threading.Lock()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # POST /api/user-mapping
@@ -140,40 +122,14 @@ def start_migration():
 
     runId MUST match the run_id used in /api/discovery/start so SQL has items.
     """
-    body            = request.get_json(silent=True) or {}
-    frontend_run_id = (body.get("runId") or body.get("run_id") or "").strip()
-    user_mapping    = body.get("userMapping") or {}
-    folder_workers  = int(body.get("folderWorkers", 4))
-    global_workers  = int(body.get("globalWorkers", 14))
+    body           = request.get_json(silent=True) or {}
+    run_id         = (body.get("runId") or "").strip()
+    user_mapping   = body.get("userMapping") or {}
+    folder_workers = int(body.get("folderWorkers", 4))
+    global_workers = int(body.get("globalWorkers", 14))
 
-    # ── Single run_id enforcement ─────────────────────────────────────────────
-    # Always use last_discovery_run_id from session.json — this is the run_id
-    # that discovery wrote SQL rows under. The frontend may generate a new
-    # timestamp-based runId on every click; we must ignore it and use the
-    # canonical discovery run_id so migration_engine finds its SQL items.
-    last_discovery_run_id = (state.config.get("last_discovery_run_id") or "").strip()
-
-    if last_discovery_run_id:
-        if frontend_run_id and frontend_run_id != last_discovery_run_id:
-            logger.warning(
-                f"[migration/start] Frontend sent runId={frontend_run_id!r} but "
-                f"last discovery used {last_discovery_run_id!r}. "
-                f"Using discovery run_id so migration finds its SQL rows."
-            )
-        run_id = last_discovery_run_id
-    elif frontend_run_id:
-        run_id = frontend_run_id
-    else:
-        return jsonify({
-            "success": False,
-            "message": "No runId found. Run discovery first.",
-        }), 400
-
-    logger.info(
-        f"[migration/start] run_id={run_id!r} "
-        f"(frontend={frontend_run_id!r}, discovery={last_discovery_run_id!r})"
-    )
-
+    if not run_id:
+        return jsonify({"success": False, "message": "runId is required"}), 400
     if not user_mapping:
         return jsonify({"success": False, "message": "userMapping is required"}), 400
 
@@ -192,7 +148,7 @@ def start_migration():
     _ensure_backend_on_path()
     _launch(run_id, user_mapping, folder_workers, global_workers)
 
-    logger.info(
+    current_app.logger.info(
         f"[migration/start] run_id={run_id} | users={len(user_mapping)}"
     )
     return jsonify({
@@ -272,7 +228,7 @@ def resume_migration():
 
     _launch(run_id, user_mapping, folder_workers, global_workers)
 
-    logger.info(
+    current_app.logger.info(
         f"[migration/resume] run_id={run_id} | users={len(user_mapping)} | "
         f"pending={pending_count} already_done={done_count}"
     )
@@ -314,105 +270,29 @@ def list_runs():
         return jsonify({"error": f"SQL error: {exc}"}), 500
 
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# POST /api/migration/stream-token
-# ─────────────────────────────────────────────────────────────────────────────
-
-@migration_bp.route("/migration/stream-token", methods=["POST"])
-@require_auth
-def get_stream_token():
-    """
-    Issues a one-time token so the frontend can open an EventSource SSE
-    connection.  EventSource cannot send Authorization headers — this token
-    is the workaround.  Always uses last_discovery_run_id as the canonical
-    run_id so the SSE stream watches the correct migration run.
-
-    Body (JSON):  { "runId": "..." }  (optional — falls back to session state)
-    Returns:      { "success": true, "token": "...", "run_id": "..." }
-    """
-    body = request.get_json(silent=True) or {}
-
-    # Always prefer the persisted discovery run_id — it is the single
-    # canonical run_id for this migration lifecycle.
-    last_discovery_run_id = (state.config.get("last_discovery_run_id") or "").strip()
-    frontend_run_id       = (body.get("runId") or body.get("run_id") or "").strip()
-    run_id                = last_discovery_run_id or frontend_run_id
-
-    if not run_id:
-        logger.warning(f"[stream-token] 400 — no run_id available, body={body!r}")
-        return jsonify({"success": False, "message": "No active discovery run found. Run discovery first."}), 400
-
-    if frontend_run_id and frontend_run_id != run_id:
-        logger.warning(
-            f"[stream-token] frontend sent {frontend_run_id!r}, "
-            f"overriding with discovery run_id={run_id!r}"
-        )
-
-    token = secrets.token_urlsafe(32)   # 256-bit cryptographically secure
-    with _stream_tokens_lock:
-        _stream_tokens[token] = {"run_id": run_id}
-
-    logger.info(f"[stream-token] issued token for run_id={run_id}")
-    return jsonify({"success": True, "token": token, "run_id": run_id})
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# GET /api/migration/stream?token=<tok>  OR  ?run_id=<run_id>
+# GET /api/migration/stream?run_id=<run_id>
 # ─────────────────────────────────────────────────────────────────────────────
 
 @migration_bp.route("/migration/stream", methods=["GET"])
+@require_auth
 def stream_migration():
     """
-    SSE stream for migration progress events.
+    SSE stream. Works identically for fresh starts and resumes.
 
-    Auth (one of two paths):
-      a) ?token=<tok>   — one-time token from POST /migration/stream-token
-                          (used by browser EventSource which can't set headers)
-      b) Authorization: Bearer <google-id-token>
-                          (used by direct callers / testing)
+    Event types:
+        phase     — { phase: "folder_creation" | "file_transfer", run_id }
+        progress  — { file_name, source_email, success, ignored, skipped, error,
+                      done, total, totals }
+        done      — { run_id, summary, totals }
+        error     — { run_id, error }
+
+    If run is not in memory (after VM restart) but is DONE in SQL,
+    immediately emits a done event so the frontend shows the last result.
     """
-    # Accept both ?token= and ?stream_token= (frontend uses both spellings).
-    # Reject the literal string "undefined" — JS sends this when the variable is unset.
-    token = (
-        request.args.get("token", "").strip()
-        or request.args.get("stream_token", "").strip()
-    )
-    if token == "undefined":
-        token = ""
-    if token:
-        with _stream_tokens_lock:
-            token_data = _stream_tokens.pop(token, None)   # single-use
-        if not token_data:
-            return jsonify({"error": "Invalid or expired stream token"}), 401
-        run_id = token_data["run_id"]
-        logger.info(f"[stream] token auth OK, run_id={run_id!r}")
-    else:
-        # ── Standard Bearer token auth path (same as @require_auth) ─────────
-        import os
-        from google.oauth2 import id_token as _id_token
-        from google.auth.transport import requests as _grequests
-
-        auth_header = request.headers.get("Authorization", "")
-        if not auth_header.startswith("Bearer "):
-            return jsonify({"error": "Missing or malformed token"}), 401
-
-        _token = auth_header.split(" ", 1)[1]
-        try:
-            _idinfo = _id_token.verify_oauth2_token(
-                _token,
-                _grequests.Request(),
-                os.environ.get("GOOGLE_CLIENT_ID"),
-            )
-            from routes.auth_routes import ALLOWED_USERS
-            if _idinfo.get("email") not in ALLOWED_USERS:
-                return jsonify({"error": "User not authorized"}), 403
-        except ValueError as _e:
-            return jsonify({"error": f"Invalid or expired Google token: {_e}"}), 401
-
-        run_id = request.args.get("run_id", "").strip()
-        if not run_id:
-            return jsonify({"error": "run_id query param required"}), 400
+    run_id = request.args.get("run_id", "").strip()
+    if not run_id:
+        return jsonify({"error": "run_id query param required"}), 400
 
     with _runs_lock:
         run = _runs.get(run_id)
@@ -464,46 +344,9 @@ def stream_migration():
 @require_auth
 def migration_status():
     """Poll-friendly snapshot. Falls back to SQL when run not in memory."""
-    # ── Auth: token (EventSource) or Bearer header (direct callers) ─────────
-    token = (
-        request.args.get("token", "").strip()
-        or request.args.get("stream_token", "").strip()
-    )
-    if token == "undefined":
-        token = ""
-    if token:
-        with _stream_tokens_lock:
-            token_data = _stream_tokens.pop(token, None)   # single-use
-        if not token_data:
-            return jsonify({"error": "Invalid or expired stream token"}), 401
-        run_id = token_data["run_id"]
-        logger.info(f"[stream] token auth OK, run_id={run_id!r}")
-    else:
-        # Standard Bearer token auth — replicate what @require_auth does
-        import os
-        from google.oauth2 import id_token as _id_token
-        from google.auth.transport import requests as _grequests
-        auth_header = request.headers.get("Authorization", "")
-        if not auth_header.startswith("Bearer "):
-            return jsonify({"error": "Unauthorized"}), 401
-        try:
-            _idinfo = _id_token.verify_oauth2_token(
-                auth_header.split(" ", 1)[1],
-                _grequests.Request(),
-                os.environ.get("GOOGLE_CLIENT_ID"),
-            )
-            from routes.auth_routes import ALLOWED_USERS
-            if _idinfo.get("email") not in ALLOWED_USERS:
-                return jsonify({"error": "User not authorized"}), 403
-        except ValueError as _e:
-            return jsonify({"error": f"Invalid token: {_e}"}), 401
-        # Use canonical discovery run_id (ignore ?run_id from frontend)
-        run_id = (
-            request.args.get("run_id", "").strip()
-            or (state.config.get("last_discovery_run_id") or "").strip()
-        )
-        if not run_id:
-            return jsonify({"error": "run_id query param required"}), 400
+    run_id = request.args.get("run_id", "").strip()
+    if not run_id:
+        return jsonify({"error": "run_id query param required"}), 400
 
     with _runs_lock:
         run = _runs.get(run_id)
@@ -563,61 +406,6 @@ def migration_summary():
     return jsonify({"error": f"Unknown run_id: {run_id}"}), 404
 
 
-
-
-@migration_bp.route("/migration/db-scan", methods=["GET"])
-@require_auth
-def db_scan():
-    """
-    GET /api/migration/db-scan?run_id=<run_id>
-    Returns per-user status counts + aggregate totals from migration_items.
-    IN_PROGRESS rows are NOT reset here — this is read-only.
-    """
-    run_id = request.args.get("run_id", "").strip()
-    if not run_id:
-        return jsonify({"error": "run_id required"}), 400
-
-    from config import Config
-    conn = Config.get_db_connection()
-    try:
-        cur = conn.cursor(dictionary=True)
-
-        # Per-user breakdown
-        cur.execute("""
-            SELECT
-                source_user_email                        AS email,
-                SUM(status = 'PENDING')                  AS pending,
-                SUM(status = 'IN_PROGRESS')              AS in_progress,
-                SUM(status = 'FAILED')                   AS failed,
-                SUM(status = 'DONE')                     AS done
-            FROM migration_items
-            WHERE migration_id = %s AND is_folder = 0
-            GROUP BY source_user_email
-            ORDER BY pending DESC, in_progress DESC
-        """, (run_id,))
-        users = [
-            {k: (int(v) if v is not None else 0) if k != "email" else (v or "")
-             for k, v in row.items()}
-            for row in (cur.fetchall() or [])
-        ]
-
-        # Aggregate totals
-        cur.execute("""
-            SELECT
-                COUNT(*)                    AS total,
-                SUM(status = 'PENDING')     AS pending,
-                SUM(status = 'IN_PROGRESS') AS in_progress,
-                SUM(status = 'FAILED')      AS failed,
-                SUM(status = 'DONE')        AS done
-            FROM migration_items
-            WHERE migration_id = %s AND is_folder = 0
-        """, (run_id,))
-        row = cur.fetchone() or {}
-        totals = {k: int(v) if v is not None else 0 for k, v in row.items()}
-
-        return jsonify({"run_id": run_id, "users": users, "totals": totals})
-    finally:
-        conn.close()
 # ─────────────────────────────────────────────────────────────────────────────
 # Background worker
 # ─────────────────────────────────────────────────────────────────────────────
@@ -670,10 +458,6 @@ def _run_migration_bg(run_id, user_mapping, folder_workers, global_workers, q):
             global_workers=global_workers,
         )
 
-        # ── Write report to disk ──────────────────────────────────────────────
-        _write_report(run_id, summary)
-        # ─────────────────────────────────────────────────────────────────────
-
         with _runs_lock:
             run = _runs.get(run_id)
             if run:
@@ -686,118 +470,10 @@ def _run_migration_bg(run_id, user_mapping, folder_workers, global_workers, q):
         }})
 
     except Exception as exc:
-        # Log full traceback so the cause of migration failure is visible in pm2 logs.
-        logger.exception(f"[migration_bg] run_id={run_id} FAILED: {exc}")
         with _runs_lock:
             run = _runs.get(run_id)
             if run: run["status"] = "error"
-        q.put({"type": "error", "data": {"run_id": run_id, "error": str(exc), "traceback": traceback.format_exc()[-2000:]}})
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Report writer
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _write_report(run_id: str, summary: dict) -> None:
-    """
-    Write a human-readable .txt report to flask-backend/reports/.
-
-    File name: migration_report_<run_id>_<YYYYMMDD_HHMMSS>.txt
-    This is the directory that status_routes.py's download_report() already
-    serves from, so the file will be immediately downloadable after migration.
-    """
-    try:
-        REPORT_DIR.mkdir(parents=True, exist_ok=True)
-        timestamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
-        report_path = REPORT_DIR / f"migration_report_{run_id}_{timestamp}.txt"
-
-        W = 65  # line width
-
-        def section(title: str) -> str:
-            return f"\n{'=' * W}\n{title}\n{'=' * W}"
-
-        def divider() -> str:
-            return "-" * W
-
-        lines = [
-            "=" * W,
-            "  MIGRATION REPORT".center(W),
-            "=" * W,
-            f"  Run ID     : {run_id}",
-            f"  Start Time : {summary.get('start_time', 'N/A')}",
-            f"  End Time   : {summary.get('end_time',   'N/A')}",
-            f"  Duration   : {summary.get('duration_seconds', 0):.1f}s",
-            "=" * W,
-            "",
-            section("OVERALL SUMMARY"),
-            f"  Total Users         : {summary.get('total_users',            0)}",
-            f"  Completed Users     : {summary.get('completed_users',        0)}",
-            f"  Failed Users        : {summary.get('failed_users',           0)}",
-            divider(),
-            f"  Files Migrated      : {summary.get('total_files_migrated',   0)}",
-            f"  Files Failed        : {summary.get('total_files_failed',     0)}",
-            f"  Files Skipped       : {summary.get('total_files_skipped',    0)}",
-            f"  Files Ignored       : {summary.get('total_files_ignored',    0)}",
-            f"  Folders Created     : {summary.get('total_folders_created',  0)}",
-            f"  Folders Failed      : {summary.get('total_folders_failed',   0)}",
-            divider(),
-            f"  Accuracy Rate       : {summary.get('accuracy_rate', 0.0):.2f}%",
-        ]
-
-        # ── Per-user breakdown ────────────────────────────────────────────────
-        user_results = summary.get("user_results", [])
-        if user_results:
-            lines.append(section("PER-USER BREAKDOWN"))
-            for u in user_results:
-                lines += [
-                    "",
-                    f"  {u.get('source_email', 'N/A')}  →  {u.get('dest_email', 'N/A')}",
-                    divider(),
-                    f"    Status          : {u.get('status', 'N/A')}",
-                    f"    Files Migrated  : {u.get('files_migrated',  0)}",
-                    f"    Files Failed    : {u.get('files_failed',    0)}",
-                    f"    Files Skipped   : {u.get('files_skipped',   0)}",
-                    f"    Files Ignored   : {u.get('files_ignored',   0)}",
-                    f"    Folders Created : {u.get('folders_created', 0)}",
-                    f"    Folders Failed  : {u.get('folders_failed',  0)}",
-                    f"    Accuracy Rate   : {u.get('accuracy_rate',   0.0):.2f}%",
-                ]
-                # Per-user errors inline
-                user_errors = u.get("errors", [])
-                if user_errors:
-                    lines.append(f"    Failed Files ({len(user_errors)}):")
-                    for e in user_errors:
-                        lines.append(
-                            f"      • {e.get('file', 'N/A')}  [{e.get('file_id', '')}]"
-                        )
-                        lines.append(
-                            f"        Error : {e.get('error', 'N/A')}"
-                        )
-
-        # ── Detailed failures ─────────────────────────────────────────────────
-        failures = summary.get("detailed_failures", [])
-        if failures:
-            lines.append(section(f"ALL FAILED FILES  ({len(failures)} total)"))
-            for idx, f in enumerate(failures, 1):
-                lines += [
-                    "",
-                    f"  [{idx}] File    : {f.get('file', 'N/A')}",
-                    f"       File ID : {f.get('file_id', 'N/A')}",
-                    f"       User    : {f.get('user', 'N/A')}",
-                    f"       Error   : {f.get('error', 'N/A')}",
-                    f"       Type    : {f.get('error_type', 'N/A')}",
-                ]
-        else:
-            lines += ["", "  No failed files. Migration completed cleanly."]
-
-        lines += ["", "=" * W, "  END OF REPORT".center(W), "=" * W, ""]
-
-        report_path.write_text("\n".join(lines), encoding="utf-8")
-        logger.info(f"[report] Saved → {report_path}")
-
-    except Exception as exc:
-        # Never let a report failure crash the background thread
-        logger.error(f"[report] Failed to write report for {run_id}: {exc}")
+        q.put({"type": "error", "data": {"run_id": run_id, "error": str(exc)}})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -849,7 +525,7 @@ def _load_run_from_sql(run_id: str):
         reset_count = cur.rowcount
         conn.commit()
         if reset_count:
-            logger.warning(
+            current_app.logger.warning(
                 f"[migration/resume] reset {reset_count} IN_PROGRESS → PENDING "
                 f"for run_id={run_id} (server likely crashed mid-transfer)"
             )
@@ -868,7 +544,7 @@ def _load_run_from_sql(run_id: str):
         }
 
         # Count pending vs done (files only, not folders).
-        # After the reset above, IN_PROGRESS no longer exists — all crashed files
+        # After the reset above, IN_PROGRESS no longer exists — all crashedfiles
         # are now PENDING and will be included in the pending counter correctly.
         cur.execute("""
             SELECT

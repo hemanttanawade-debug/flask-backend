@@ -13,8 +13,8 @@ KEY DESIGN DECISIONS
        uploads/users.csv
 
 3. SESSION PERSISTENCE:
-   All wizard state (session_id, domain, email, migration_mode, csv_file_path,
-   run_id) is written to uploads/session.json on every change.
+   All wizard state (session_id, domain, email, migration_mode, csv_file_path)
+   is written to uploads/session.json on every change.
    On process start the file is read back automatically — a VM restart,
    gunicorn reload, or OOM-kill does NOT lose wizard state.
 
@@ -33,11 +33,6 @@ KEY DESIGN DECISIONS
    - release_migration_lock() is called automatically when it finishes.
    - Lock state is persisted in session.json so it survives VM restarts.
    - hard_reset() is the only operation that overrides the lock.
-
-7. RUN ID:
-   - update_run_id(rid) stores the latest migration run_id from the frontend.
-   - Persisted in session.json so it survives VM restarts.
-   - Cleared only by hard_reset().
 """
 
 import os
@@ -104,7 +99,6 @@ config = {
 
 user_mappings  = []
 csv_file_path: str = str(CSV_PATH)
-run_id: str = ""
 
 # Legacy dict kept for status_routes compatibility
 migration = {
@@ -130,7 +124,6 @@ def _persist():
         "session_id":       session_id,
         "config":           config,
         "csv_file_path":    csv_file_path,
-        "run_id":           run_id,
         "migration_active": migration_active,
     }
     try:
@@ -148,7 +141,7 @@ def _load():
     Read uploads/session.json on module import and restore state.
     If the file is missing or corrupt a fresh session is created.
     """
-    global session_id, config, csv_file_path, run_id, migration_active
+    global session_id, config, csv_file_path, migration_active
 
     if not SESSION_FILE.exists():
         session_id = str(uuid.uuid4())
@@ -169,7 +162,6 @@ def _load():
         config["dest_credentials_file"]   = str(DEST_CREDENTIALS_PATH)
 
         csv_file_path    = data.get("csv_file_path", str(CSV_PATH))
-        run_id           = data.get("run_id", "")
         migration_active = bool(data.get("migration_active", False))
 
     except Exception as e:
@@ -178,7 +170,6 @@ def _load():
             f"[session_state] session.json corrupt, starting fresh: {e}"
         )
         session_id       = str(uuid.uuid4())
-        run_id           = ""
         migration_active = False
         _persist()
 
@@ -222,20 +213,6 @@ def update_config(**kwargs):
     _persist()
 
 
-def update_run_id(rid: str):
-    """
-    Store the latest migration run_id and persist to disk immediately.
-    Survives VM restarts and gunicorn reloads.
-    Cleared only by hard_reset().
-
-    Example:
-        state.update_run_id("abc123-run-id-from-frontend")
-    """
-    global run_id
-    run_id = rid
-    _persist()
-
-
 def credentials_exist() -> dict[str, bool]:
     return {
         "source": SOURCE_CREDENTIALS_PATH.exists(),
@@ -276,7 +253,7 @@ def hard_reset():
     Called ONLY from DELETE /api/reset ("Delete all migration data").
     Releases the migration lock unconditionally.
     """
-    global session_id, config, user_mappings, csv_file_path, run_id, migration_active
+    global session_id, config, user_mappings, csv_file_path, migration_active
 
     with _lock_mutex:
         migration_active = False
@@ -284,7 +261,6 @@ def hard_reset():
     session_id    = str(uuid.uuid4())
     user_mappings = []
     csv_file_path = str(CSV_PATH)
-    run_id        = ""
 
     config = {
         "source_domain":           "",

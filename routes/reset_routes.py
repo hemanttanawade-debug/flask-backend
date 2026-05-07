@@ -131,9 +131,7 @@ def _reset_filesystem() -> list[str]:
 _SQL_TABLES_IN_ORDER = [
     # child tables first (FK constraints)
     "migration_permissions",
-    "migration_folder_mapping",
-    "migration_items",
-    "migration_users",   # may not exist in older schemas — handled gracefully
+    "migration_items",   # may not exist in older schemas — handled gracefully
     "migration_runs",
 ]
 
@@ -197,9 +195,7 @@ def _delete_sql_data(run_ids: list[str], delete_all: bool) -> dict:
 
             table_col_map = {
                 "migration_permissions":  "file_id IN (SELECT file_id FROM migration_items WHERE migration_id IN ({ph}))",
-                "migration_folder_mapping": "migration_id IN ({ph})",
                 "migration_items":        "migration_id IN ({ph})",
-                "migration_users":        "migration_id IN ({ph})",
                 "migration_runs":         "migration_id IN ({ph})",
             }
 
@@ -249,9 +245,7 @@ def _record(totals: dict, table: str, count: int):
     mapping = {
         "migration_runs":         "runs_deleted",
         "migration_items":        "items_deleted",
-        "migration_folder_mapping": "folders_deleted",
         "migration_permissions":  "permissions_deleted",
-        "migration_users":        "users_deleted",
     }
     key = mapping.get(table)
     if key:

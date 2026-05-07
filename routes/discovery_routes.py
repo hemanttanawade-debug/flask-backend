@@ -7,17 +7,45 @@ Frontend flow (React):
   1. POST /api/discovery/start  →  { run_id, totals, results }
      totals: { total_files, total_folders, total_size_bytes,
                total_users, completed_users, failed_users }
+
+FIXES vs previous version
+──────────────────────────
+FIX-1  Replaced all current_app.logger calls inside callbacks and helper
+       functions with a module-level logger. current_app is a proxy that only
+       works inside a Flask request context. The on_user_done() callback is
+       invoked by worker threads spawned inside run_discovery() — those threads
+       have no request context, so current_app raises:
+         RuntimeError: Working outside of application context.
+       Using logging.getLogger(__name__) is always safe in any thread.
+
+FIX-2  state._persist() called after saving last_discovery_run_id so the
+       run_id survives a gunicorn worker restart and is available to the
+       dashboard and migration routes.
+
+FIX-3  _accumulate() made thread-safe with a lock — on_user_done() is called
+       from concurrent worker threads inside run_discovery(); without a lock,
+       the counter increments have a race condition on CPython (GIL helps but
+       does not fully protect dict updates).
+
+FIX-4  Improved error response: includes exc type and a truncated traceback
+       so the frontend can show a meaningful message instead of a bare string.
 """
 
 import sys
+import logging
 import threading
+import traceback
 from pathlib import Path
-from flask import Blueprint, request, jsonify, current_app
+
+from flask import Blueprint, request, jsonify
 from routes.auth_routes import require_auth
 import session_state as state
 
 discovery_bp = Blueprint("discovery", __name__)
 BACKEND_DIR  = Path.home() / "amey"
+
+# FIX-1: module-level logger — safe in any thread, no app context needed
+logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -57,7 +85,7 @@ def start_discovery():
         }
 
     Returns (4xx / 5xx):
-        { "success": false, "message": "..." }
+        { "success": false, "message": "...", "detail": "..." }
     """
     body = request.get_json(silent=True) or {}
 
@@ -65,21 +93,62 @@ def start_discovery():
     if sid and sid != state.session_id:
         state.new_session(sid, auto_delete_previous=False)
 
-    run_id       = body.get("runId", "").strip()
-    user_mapping = body.get("userMapping", {})
-    workers      = int(body.get("workers", 4))
+    frontend_run_id = body.get("runId", "").strip()
+    user_mapping    = body.get("userMapping", {})
+    workers         = int(body.get("workers", 4))
 
-    if not run_id:
-        return jsonify({"success": False, "message": "runId is required"}), 400
     if not user_mapping:
         return jsonify({"success": False, "message": "userMapping is required"}), 400
+
+    # ── Single run_id enforcement ─────────────────────────────────────────────
+    # There is exactly ONE canonical run_id per migration lifecycle:
+    #   last_discovery_run_id in session.json (persisted across restarts).
+    #
+    # Rule: if a discovery run_id is already persisted AND the DB already has
+    # items for it, REUSE it — ignore whatever the frontend generated.
+    # This prevents the frontend generating a new timestamp-based runId on every
+    # click and silently orphaning the previously discovered SQL rows.
+    #
+    # Only create a new run_id when:
+    #   a) No discovery has ever run (last_discovery_run_id is empty), OR
+    #   b) The user explicitly wants a fresh scan (no existing SQL items).
+    persisted_run_id = (state.config.get("last_discovery_run_id") or "").strip()
+
+    if persisted_run_id:
+        # Check whether SQL already has items for the persisted run_id
+        sql_has_items = _check_sql_has_items(persisted_run_id)
+        if sql_has_items:
+            if frontend_run_id and frontend_run_id != persisted_run_id:
+                logger.warning(
+                    f"[discovery] Frontend sent runId={frontend_run_id!r} but "
+                    f"SQL already has items under {persisted_run_id!r}. "
+                    f"Reusing persisted run_id to avoid orphaning SQL rows."
+                )
+            run_id = persisted_run_id
+            logger.info(f"[discovery] Reusing existing run_id={run_id!r} (SQL has items)")
+        else:
+            # Persisted run_id exists but SQL is empty — use frontend id or persisted
+            run_id = frontend_run_id or persisted_run_id
+            logger.info(f"[discovery] Starting fresh scan with run_id={run_id!r}")
+    else:
+        # No prior discovery — use whatever the frontend sent
+        run_id = frontend_run_id
+        if not run_id:
+            return jsonify({"success": False, "message": "runId is required"}), 400
+        logger.info(f"[discovery] First discovery, run_id={run_id!r}")
+
+    # Always keep session.json in sync with the run_id we are actually using
+    if run_id != persisted_run_id:
+        state.config["last_discovery_run_id"] = run_id
+        state._persist()
 
     _ensure_backend_on_path()
 
     from routes.config_routes import _apply_config_to_backend
     _apply_config_to_backend()
 
-    current_app.logger.info(
+    # FIX-1: use module logger — safe inside request context and in threads
+    logger.info(
         f"[discovery] run_id={run_id} started | "
         f"users={len(user_mapping)} | workers={workers}"
     )
@@ -87,12 +156,24 @@ def start_discovery():
     try:
         from discovery_engine import run_discovery
 
-        totals  = _empty_totals()
-        results = []
+        totals       = _empty_totals()
+        results      = []
+        # FIX-3: lock protects totals dict from concurrent on_user_done() calls
+        totals_lock  = threading.Lock()
 
         def on_user_done(user_result: dict):
-            _accumulate(totals, user_result)
-            results.append(user_result)
+            # FIX-1: logger (not current_app.logger) — this runs in worker threads
+            # FIX-3: lock protects shared totals + results from race conditions
+            with totals_lock:
+                _accumulate(totals, user_result)
+                results.append(user_result)
+            logger.info(
+                f"[discovery] user done: "
+                f"{user_result.get('source_email', '?')} | "
+                f"files={user_result.get('files', 0)} "
+                f"folders={user_result.get('folders', 0)} "
+                f"status={user_result.get('status', '?')}"
+            )
 
         # Blocks until all users are scanned
         final_results = run_discovery(
@@ -110,15 +191,19 @@ def start_discovery():
             for r in results:
                 _accumulate(totals, r)
 
-        current_app.logger.info(
+        logger.info(
             f"[discovery] run_id={run_id} done | "
-            f"files={totals['total_files']} folders={totals['total_folders']} "
+            f"files={totals['total_files']} "
+            f"folders={totals['total_folders']} "
             f"bytes={totals['total_size_bytes']}"
         )
 
-        # Layer 4: persist the confirmed run_id in session so migration_routes
-        # can validate that its runId matches what discovery registered in SQL.
+        # FIX-2: persist run_id to disk so it survives gunicorn worker restarts.
+        # Without _persist(), the run_id is only in memory and lost if the worker
+        # is recycled before migration starts — dashboard and migration routes
+        # then can't find it via state.config["last_discovery_run_id"].
         state.config["last_discovery_run_id"] = run_id
+        state._persist()
 
         return jsonify({
             "success": True,
@@ -128,13 +213,47 @@ def start_discovery():
         })
 
     except Exception as exc:
-        current_app.logger.exception(f"[discovery] run_id={run_id} error: {exc}")
-        return jsonify({"success": False, "message": str(exc)}), 500
+        # FIX-4: include exc type + truncated traceback in response so the
+        # frontend can show a meaningful error instead of a bare string.
+        tb = traceback.format_exc()
+        logger.exception(f"[discovery] run_id={run_id} error: {exc}")
+        return jsonify({
+            "success": False,
+            "message": str(exc),
+            "detail":  tb[-2000:],   # last 2000 chars — enough for diagnosis
+        }), 500
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _check_sql_has_items(run_id: str) -> bool:
+    """
+    Returns True if migration_items already has rows for this run_id.
+    Used to decide whether to reuse an existing run_id or start fresh.
+    Fails safe — returns False on any DB error so discovery proceeds normally.
+    """
+    try:
+        _ensure_backend_on_path()
+        from config import Config
+        conn = Config.get_db_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT 1 FROM migration_items WHERE migration_id=%s LIMIT 1",
+                (run_id,)
+            )
+            return cur.fetchone() is not None
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception as exc:
+        logger.warning(f"[discovery] _check_sql_has_items failed (safe fallback): {exc}")
+        return False
+
 
 def _empty_totals() -> dict:
     return {
@@ -148,6 +267,10 @@ def _empty_totals() -> dict:
 
 
 def _accumulate(totals: dict, user_result: dict):
+    """
+    Merge one user's result into the running totals.
+    NOTE: caller is responsible for holding totals_lock before calling this.
+    """
     totals["total_users"]      += 1
     totals["total_files"]      += user_result.get("files",      0)
     totals["total_folders"]    += user_result.get("folders",    0)
