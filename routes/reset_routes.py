@@ -113,6 +113,7 @@ def _reset_filesystem() -> list[str]:
         state.DEST_CREDENTIALS_PATH,
         state.CSV_PATH,
         state.SESSION_FILE,
+        state.UPLOAD_DIR / "admin",
     ]
     removed = [
         str(p.relative_to(state.UPLOAD_DIR))

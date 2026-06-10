@@ -19,6 +19,9 @@ from routes.discovery_routes import discovery_bp
 from routes.reset_routes import reset_bp
 from routes.export_routes import export_bp
 from routes.dashboard_routes import dashboard_bp
+from routes.shared_drive_routes import shared_drive_bp
+from routes.shared_drive_storage_routes import shared_drive_storage_bp
+from routes.shared_drive_discovery_routes import sd_discovery_bp
 
 def create_app():
     app = Flask(__name__)
@@ -45,6 +48,10 @@ def create_app():
     app.register_blueprint(reset_bp,     url_prefix="/api")
     app.register_blueprint(export_bp,    url_prefix="/api")
     app.register_blueprint(dashboard_bp, url_prefix="/api")
+    app.register_blueprint(shared_drive_bp,  url_prefix="/api")
+    app.register_blueprint(shared_drive_storage_bp, url_prefix="/api")
+    app.register_blueprint(sd_discovery_bp,  url_prefix="/api")
+
     return app
 
 

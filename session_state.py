@@ -99,7 +99,8 @@ config = {
     "dest_admin_email":        "",
     "dest_credentials_file":   str(DEST_CREDENTIALS_PATH),
     "migration_mode":          "full",
-    "last_discovery_run_id":   "",
+    "last_discovery_run_id":   "",   # My Drive discovery
+    "last_sd_discovery_run_id": "",   # Shared Drive discovery
 }
 
 user_mappings  = []
@@ -294,7 +295,8 @@ def hard_reset():
         "dest_admin_email":        "",
         "dest_credentials_file":   str(DEST_CREDENTIALS_PATH),
         "migration_mode":          "full",
-        "last_discovery_run_id":   "",
+        "last_discovery_run_id":   "",   # My Drive discovery
+        "last_sd_discovery_run_id": "",   # Shared Drive discovery
     }
 
     for path in [SOURCE_CREDENTIALS_PATH, DEST_CREDENTIALS_PATH]:
